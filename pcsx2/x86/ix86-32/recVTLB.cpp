@@ -121,7 +121,7 @@ namespace vtlb_private
 	// ------------------------------------------------------------------------
 	// Prepares eax and ecx for Direct or Indirect operations.
 	//
-	static void DynGen_PrepRegs(int addr_reg, int value_reg, u32 sz, bool xmm)
+	static void DynGen_PrepRegs(int addr_reg, int value_reg, u32 sz, bool xmm, bool write)
 	{
 		_freeX86reg(arg1regd);
 		EE::Profiler.EmitMem(addr_reg);
@@ -149,9 +149,10 @@ namespace vtlb_private
 			}
 		}
 
+		VTLBVirtual* const vmap = (CHECK_FULLTLB && write) ? vtlbdata.vmap_write : vtlbdata.vmap;
 		xMOV(eax, arg1regd);
 		xSHR(eax, VTLB_PAGE_BITS);
-		xMOV(rax, ptrNative[xComplexAddress(arg3reg, vtlbdata.vmap, rax * wordsize)]);
+		xMOV(rax, ptrNative[xComplexAddress(arg3reg, vmap, rax * wordsize)]);
 		xADD(arg1reg, rax);
 	}
 
@@ -262,6 +263,8 @@ static void DynGen_HandlerTest(const GenDirectFn& gen_direct, int mode, int bits
 	xForwardJump8 done;
 	to_handler.SetTarget();
 	xFastCall(GetIndirectDispatcherPtr(mode, szidx, sign));
+	if (CHECK_FULLTLB)
+		recRegisterExceptionInformation();
 	done.SetTarget();
 }
 
@@ -355,6 +358,22 @@ void vtlb_DynGenDispatchers()
 	Perf::any.Register(m_IndirectDispatchers, INDIRECT_DISPATCHERS_SIZE, "TLB Dispatcher");
 
 	xSetPtr(m_IndirectDispatchers + INDIRECT_DISPATCHERS_SIZE);
+	if (CHECK_FULLTLB)
+	{
+		xAlignCallTarget();
+#ifdef _WIN32
+		constexpr u32 recompiled_return_address_offset = 48;
+#else
+		constexpr u32 recompiled_return_address_offset = 16;
+#endif
+		const void* const tlb_refill_read = recGenerateDynamicExceptionExit(recompiled_return_address_offset, EXC_CODE_TLBL);
+		const void* const tlb_refill_write = recGenerateDynamicExceptionExit(recompiled_return_address_offset, EXC_CODE_TLBS);
+		const void* const tlb_invalid_read = recGenerateDynamicExceptionExit(recompiled_return_address_offset, EXC_CODE_TLBL | EXC_CODE_TLB_INVALID);
+		const void* const tlb_invalid_write = recGenerateDynamicExceptionExit(recompiled_return_address_offset, EXC_CODE_TLBS | EXC_CODE_TLB_INVALID);
+		const void* const tlb_modified = recGenerateDynamicExceptionExit(recompiled_return_address_offset, EXC_CODE_Mod);
+		const void* const bus_error = recGenerateDynamicExceptionExit(recompiled_return_address_offset, EXC_CODE_DBE);
+		vtlb_SetExceptionHandlers(tlb_refill_read, tlb_refill_write, tlb_invalid_read, tlb_invalid_write, tlb_modified, bus_error);
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -372,7 +391,7 @@ int vtlb_DynGenReadNonQuad(u32 bits, bool sign, bool xmm, int addr_reg, vtlb_Rea
 	{
 		iFlushCall(FLUSH_FULLVTLB);
 
-		DynGen_PrepRegs(addr_reg, -1, bits, xmm);
+		DynGen_PrepRegs(addr_reg, -1, bits, xmm, false);
 		DynGen_HandlerTest([bits, sign]() { DynGen_DirectRead(bits, sign); }, 0, bits, sign && bits < 64);
 
 		if (!xmm)
@@ -560,7 +579,7 @@ int vtlb_DynGenReadQuad(u32 bits, int addr_reg, vtlb_ReadRegAllocCallback dest_r
 	{
 		iFlushCall(FLUSH_FULLVTLB);
 
-		DynGen_PrepRegs(arg1regd.GetId(), -1, bits, true);
+		DynGen_PrepRegs(arg1regd.GetId(), -1, bits, true, false);
 		DynGen_HandlerTest([bits]() {DynGen_DirectRead(bits, false); },  0, bits);
 
 		const int reg = dest_reg_alloc ? dest_reg_alloc() : (_freeXMMreg(0), 0); // Handler returns in xmm0
@@ -685,7 +704,7 @@ void vtlb_DynGenWrite(u32 sz, bool xmm, int addr_reg, int value_reg)
 	{
 		iFlushCall(FLUSH_FULLVTLB);
 
-		DynGen_PrepRegs(addr_reg, value_reg, sz, xmm);
+		DynGen_PrepRegs(addr_reg, value_reg, sz, xmm, true);
 		DynGen_HandlerTest([sz]() { DynGen_DirectWrite(sz); }, 1, sz);
 		return;
 	}
@@ -983,7 +1002,7 @@ void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc, 
 
 	if (is_load)
 	{
-		DynGen_PrepRegs(address_register, -1, size_in_bits, is_xmm);
+		DynGen_PrepRegs(address_register, -1, size_in_bits, is_xmm, false);
 		DynGen_HandlerTest([size_in_bits, is_signed]() {DynGen_DirectRead(size_in_bits, is_signed); },  0, size_in_bits, is_signed && size_in_bits <= 32);
 
 		if (size_in_bits == 128)
@@ -1028,7 +1047,7 @@ void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc, 
 			}
 		}
 
-		DynGen_PrepRegs(address_register, data_register, size_in_bits, is_xmm);
+		DynGen_PrepRegs(address_register, data_register, size_in_bits, is_xmm, true);
 		DynGen_HandlerTest([size_in_bits]() { DynGen_DirectWrite(size_in_bits); }, 1, size_in_bits);
 	}
 

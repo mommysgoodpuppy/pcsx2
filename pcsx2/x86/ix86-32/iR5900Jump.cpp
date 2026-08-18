@@ -125,7 +125,13 @@ void recJALR()
 	EE::Profiler.EmitOp(eeOpcode::JALR);
 
 	const u32 newpc = pc + 4;
-	const bool swap = (EmuConfig.Gamefixes.GoemonTlbHack || _Rd_ == _Rs_) ? false : TrySwapDelaySlot(_Rs_, 0, _Rd_, true);
+	// A JALR link register is architecturally visible to its delay slot. If a
+	// swapped delay-slot load/store takes a full-TLB exception, its generated
+	// exception state predates the link write and restores the caller's stale
+	// value. Keep the architectural order when exceptions can escape generated
+	// code.
+	const bool swap = (CHECK_FULLTLB || EmuConfig.Gamefixes.GoemonTlbHack || _Rd_ == _Rs_) ?
+		false : TrySwapDelaySlot(_Rs_, 0, _Rd_, true);
 
 
 	int wbreg = -1;

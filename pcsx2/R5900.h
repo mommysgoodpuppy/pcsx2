@@ -400,6 +400,7 @@ extern void cpuReset();
 extern void cpuException(u32 code, u32 bd);
 extern void cpuTlbMissR(u32 addr, u32 bd);
 extern void cpuTlbMissW(u32 addr, u32 bd);
+extern void cpuTlbMiss(u32 addr, u32 bd, u32 excode);
 extern void cpuTestHwInts();
 extern void cpuClearInt(uint n);
 extern void GoemonPreloadTlb();
@@ -444,3 +445,4 @@ int isBreakpointNeeded(u32 addr);
 #define EXC_CODE_WATCH  EXC_CODE(23)
 #define EXC_CODE__MASK  0x0000007c
 #define EXC_CODE__SHIFT 2
+#define EXC_CODE_TLB_INVALID 0x00010000

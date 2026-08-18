@@ -599,18 +599,43 @@ void SpeedWrite(u32 addr, u16 value, int width)
 				case EEPROM_ADDR3:
 				case EEPROM_ADDR4:
 				case EEPROM_ADDR5:
+				{
+					// Address bits arrive MSB first, so the bit clocked in at
+					// step n lands in address bit (5 - n). The mask has to clear
+					// that same bit; clearing bit n instead leaves stale bits
+					// from the previous transfer in the address.
+					const int n = dev9.eeprom_state - EEPROM_ADDR0;
 					dev9.eeprom_address =
-						(dev9.eeprom_address & (63 ^ (1 << (dev9.eeprom_state - EEPROM_ADDR0)))) |
-						((value >> (dev9.eeprom_state - EEPROM_ADDR0)) & (0x20 >> (dev9.eeprom_state - EEPROM_ADDR0)));
+						(dev9.eeprom_address & (63 ^ (0x20 >> n))) |
+						((value >> n) & (0x20 >> n));
 					dev9.eeprom_state++;
+					// A real 93C46 emits its leading dummy zero on the rising
+					// edge of the last address clock, which drivers do not
+					// sample -- their first data clock already returns D15.
+					// Leaving eeprom_bit at the 0xFF sentinel here would spend
+					// one of those 16 data clocks on the dummy instead, so
+					// every word would come back shifted right by one bit.
+					if (dev9.eeprom_state == EEPROM_TDATA)
+						dev9.eeprom_bit = 0;
 					break;
+				}
 				case EEPROM_TDATA:
 				{
 					if (dev9.eeprom_command == 1) // write
 					{
-						dev9.eeprom[dev9.eeprom_address] =
-							(dev9.eeprom[dev9.eeprom_address] & (63 ^ (1 << dev9.eeprom_bit))) |
-							((value >> dev9.eeprom_bit) & (0x8000 >> dev9.eeprom_bit));
+						// Data is clocked in MSB first on PP_DIN (bit 5), so
+						// bit b of the transfer is word bit (15 - b). The old
+						// mask was a 6-bit one applied to a 16-bit word, which
+						// wiped the top ten bits. The 0xFF sentinel should no
+						// longer reach here now that entering TDATA clears it,
+						// but guard anyway rather than shift by 255.
+						if (dev9.eeprom_bit != 0xFF)
+						{
+							const u16 word_bit = 0x8000 >> dev9.eeprom_bit;
+							dev9.eeprom[dev9.eeprom_address] =
+								(dev9.eeprom[dev9.eeprom_address] & ~word_bit) |
+								((value & 0x20) ? word_bit : 0);
+						}
 						dev9.eeprom_bit++;
 						if (dev9.eeprom_bit == 16)
 						{

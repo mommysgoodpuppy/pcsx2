@@ -22,6 +22,8 @@
 #include "common/HeapArray.h"
 #include "common/Perf.h"
 
+#include <unordered_map>
+
 // Only for MOVQ workaround.
 #include "common/emitter/internal.h"
 
@@ -52,7 +54,25 @@ u32 maxrecmem = 0;
 alignas(16) static uptr recLUT[_64kb];
 alignas(16) static u32 hwLUT[_64kb];
 
-static __fi u32 HWADDR(u32 mem) { return hwLUT[mem >> 16] + mem; }
+static __fi u32 HWADDR(u32 mem)
+{
+	if (CHECK_FULLTLB && (cpuRegs.CP0.n.EntryHi & 0xff) != 0 && mem < 0x80000000u &&
+		vtlb_private::vtlbdata.ppmap)
+	{
+		const auto& entry = vtlb_private::vtlbdata.vmap[mem >> vtlb_private::VTLB_PAGE_BITS];
+		if (!entry.isHandler(mem))
+			return vtlb_V2P(mem);
+	}
+
+	return hwLUT[mem >> 16] + mem;
+}
+
+static __fi void* recGetMemPtr(u32 vaddr)
+{
+	// kuseg is translated by the guest TLB. Kernel segments retain the direct
+	// physical mapping expected by the existing recompiler bookkeeping.
+	return (CHECK_FULLTLB && vaddr < 0x80000000u) ? vtlb_GetVirtualPtr(vaddr) : PSM(vaddr);
+}
 
 u32 s_nBlockCycles = 0; // cycles of current block recompiling
 bool s_nBlockInterlocked = false; // Block is VU0 interlocked
@@ -104,6 +124,62 @@ static void iBranchTest(u32 newpc = 0xffffffff);
 static void ClearRecLUT(BASEBLOCK* base, int count);
 static u32 scaleblockcycles();
 static void recExitExecution();
+
+struct RecExceptionInfo
+{
+	struct RegInfo
+	{
+		u8 reg;
+		u8 type;
+	};
+
+	u32 mips_pc;
+	u32 mips_code;
+	bool mips_delay_slot;
+	RegInfo gpr_info[iREGCNT_GPR];
+	RegInfo xmm_info[iREGCNT_XMM];
+	std::vector<std::pair<u32, u64>> constant_values;
+};
+
+static std::unordered_map<const void*, RecExceptionInfo> s_rec_exception_info;
+
+static void recTraceFullTLBException(const RecExceptionInfo& info, const void* rip, u32 address, u32 excode)
+{
+	static u32 trace_count = 0;
+	if (info.mips_pc != 0x00406150 || address != 0x00580318 || trace_count++ >= 64)
+		return;
+
+	const u32 asid = cpuRegs.CP0.n.EntryHi & 0xff;
+	const auto& read_map = vtlb_private::vtlbdata.vmap[address >> vtlb_private::VTLB_PAGE_BITS];
+	const auto& write_map = vtlb_private::vtlbdata.vmap_write[address >> vtlb_private::VTLB_PAGE_BITS];
+	Console.Error("FULLTLB trace #%u: rip=%p pc=%08x code=%08x excode=%08x bd=%u addr=%08x gp=%08x",
+		trace_count, rip, info.mips_pc, info.mips_code, excode, info.mips_delay_slot,
+		address, cpuRegs.GPR.r[28].UL[0]);
+	Console.Error("FULLTLB CP0 before: ASID=%02x EntryHi=%08x Status=%08x Cause=%08x EPC=%08x BadVAddr=%08x",
+		asid, cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause,
+		cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.BadVAddr);
+	Console.Error("FULLTLB VTLB: read_raw=%llx read_handler=%u read_id=%u write_raw=%llx write_handler=%u write_id=%u",
+		static_cast<unsigned long long>(read_map.raw()), read_map.isHandler(address),
+		read_map.isHandler(address) ? read_map.assumeHandlerGetID() : 0,
+		static_cast<unsigned long long>(write_map.raw()), write_map.isHandler(address),
+		write_map.isHandler(address) ? write_map.assumeHandlerGetID() : 0);
+
+	for (u32 i = 0; i < std::size(tlb); i++)
+	{
+		const tlbs& entry = tlb[i];
+		const u32 page = address >> 12;
+		const u32 mask = ((~entry.Mask()) << 1) & 0xfffff;
+		if ((page & mask) != ((entry.VPN2() >> 12) & mask))
+			continue;
+
+		Console.Error("FULLTLB HW TLB %u: VPN2=%08x mask=%03x ASID=%02x active=%u G=%u "
+			"Lo0=%08x(P=%08x V=%u D=%u) Lo1=%08x(P=%08x V=%u D=%u)",
+			i, entry.VPN2(), entry.Mask(), entry.EntryHi.ASID,
+			entry.isGlobal() || entry.EntryHi.ASID == asid, entry.isGlobal(), entry.EntryLo0.UL,
+			entry.PFN0(), entry.EntryLo0.V, entry.EntryLo0.D, entry.EntryLo1.UL,
+			entry.PFN1(), entry.EntryLo1.V, entry.EntryLo1.D);
+	}
+}
 
 #ifdef TRACE_BLOCKS
 static void pauseAAA()
@@ -395,6 +471,18 @@ static const void* DispatchBlockDiscard = nullptr;
 static const void* DispatchPageReset = nullptr;
 static const void* UnmappedRecLUTPage = nullptr;
 
+static uptr recGetDispatchBlock(u32 addr)
+{
+	if (CHECK_FULLTLB && (cpuRegs.CP0.n.EntryHi & 0xff) != 0 && addr < 0x80000000u)
+	{
+		const auto& entry = vtlb_private::vtlbdata.vmap[addr >> vtlb_private::VTLB_PAGE_BITS];
+		if (entry.isHandler(addr))
+			return reinterpret_cast<uptr>(JITCompile);
+	}
+
+	return PC_GETBLOCK(HWADDR(addr))->GetFnptr();
+}
+
 static void recEventTest()
 {
 	_cpuEventTest_Shared();
@@ -420,11 +508,19 @@ static const void* _DynGen_JITCompile()
 	// u32 addr = cpuRegs.pc;
 	// void(**base)() = (void(**)())recLUT[addr >> 16];
 	// base[addr >> 2]();
-	xMOV(eax, ptr[&cpuRegs.pc]);
-	xMOV(edx, eax);
-	xSHR(eax, 16);
-	xMOV(rcx, ptrNative[xComplexAddress(rcx, recLUT, rax * wordsize)]);
-	xJMP(ptrNative[rdx * (wordsize / 4) + rcx]);
+	if (CHECK_FULLTLB)
+	{
+		xFastCall(reinterpret_cast<const void*>(recGetDispatchBlock), ptr32[&cpuRegs.pc]);
+		xJMP(rax);
+	}
+	else
+	{
+		xMOV(eax, ptr[&cpuRegs.pc]);
+		xMOV(edx, eax);
+		xSHR(eax, 16);
+		xMOV(rcx, ptrNative[xComplexAddress(rcx, recLUT, rax * wordsize)]);
+		xJMP(ptrNative[rdx * (wordsize / 4) + rcx]);
+	}
 
 	return retval;
 }
@@ -438,11 +534,19 @@ static const void* _DynGen_DispatcherReg()
 	// u32 addr = cpuRegs.pc;
 	// void(**base)() = (void(**)())recLUT[addr >> 16];
 	// base[addr >> 2]();
-	xMOV(eax, ptr[&cpuRegs.pc]);
-	xMOV(edx, eax);
-	xSHR(eax, 16);
-	xMOV(rcx, ptrNative[xComplexAddress(rcx, recLUT, rax * wordsize)]);
-	xJMP(ptrNative[rdx * (wordsize / 4) + rcx]);
+	if (CHECK_FULLTLB)
+	{
+		xFastCall(reinterpret_cast<const void*>(recGetDispatchBlock), ptr32[&cpuRegs.pc]);
+		xJMP(rax);
+	}
+	else
+	{
+		xMOV(eax, ptr[&cpuRegs.pc]);
+		xMOV(edx, eax);
+		xSHR(eax, 16);
+		xMOV(rcx, ptrNative[xComplexAddress(rcx, recLUT, rax * wordsize)]);
+		xJMP(ptrNative[rdx * (wordsize / 4) + rcx]);
+	}
 
 	return retval;
 }
@@ -538,6 +642,17 @@ static void _DynGen_Dispatchers()
 
 static void recError(u32 error)
 {
+	if (CHECK_FULLTLB)
+	{
+		Console.Error("FULLTLB dispatcher error=%u pc=%08x cycle=%llu ASID=%02x Status=%08x Cause=%08x EPC=%08x",
+			error, cpuRegs.pc, static_cast<unsigned long long>(cpuRegs.cycle),
+			cpuRegs.CP0.n.EntryHi & 0xff, cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause,
+			cpuRegs.CP0.n.EPC);
+		for (u32 i = 0; i < 32; i += 4)
+			Console.Error("FULLTLB final GPR r%u=%08x r%u=%08x r%u=%08x r%u=%08x", i,
+				cpuRegs.GPR.r[i].UL[0], i + 1, cpuRegs.GPR.r[i + 1].UL[0], i + 2,
+				cpuRegs.GPR.r[i + 2].UL[0], i + 3, cpuRegs.GPR.r[i + 3].UL[0]);
+	}
 	switch (error)
 	{
 		case 0:
@@ -671,6 +786,7 @@ static void recResetRaw()
 		memset(s_pInstCache, 0, sizeof(EEINST) * s_nInstCacheSize);
 
 	recBlocks.Reset();
+	s_rec_exception_info.clear();
 	vtlb_ClearLoadStoreInfo();
 
 	g_branch = 0;
@@ -686,6 +802,7 @@ void recShutdown()
 	recLutReserve_RAM.deallocate();
 
 	recBlocks.Reset();
+	s_rec_exception_info.clear();
 
 	recRAM = recROM = recROM1 = recROM2 = nullptr;
 
@@ -807,9 +924,9 @@ void R5900::Dynarec::OpcodeImpl::recBREAK()
 // Size is in dwords (4 bytes)
 void recClear(u32 addr, u32 size)
 {
+	addr = HWADDR(addr);
 	if ((addr) >= maxrecmem || !(recLUT[(addr) >> 16] + (addr & ~0xFFFFUL)))
 		return;
-	addr = HWADDR(addr);
 
 	int blockidx = recBlocks.LastIndex(addr + size * 4 - 4);
 
@@ -938,10 +1055,10 @@ u8* recEndThunk()
 bool TrySwapDelaySlot(u32 rs, u32 rt, u32 rd, bool allow_loadstore)
 {
 #if 1
-	if (g_recompilingDelaySlot)
+	if (CHECK_FULLTLB || g_recompilingDelaySlot)
 		return false;
 
-	const u32 opcode_encoded = *(u32*)PSM(pc);
+	const u32 opcode_encoded = *static_cast<u32*>(recGetMemPtr(pc));
 	if (opcode_encoded == 0)
 	{
 		recompileNextInstruction(true, true);
@@ -1700,7 +1817,7 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 	{
 #ifdef DUMP_BLOCKS
 		std::string disasm;
-		disR5900Fasm(disasm, *(u32*)PSM(pc), pc, false);
+		disR5900Fasm(disasm, *static_cast<u32*>(recGetMemPtr(pc)), pc, false);
 		fprintf(stderr, "Compiling delay slot %08X %s\n", pc, disasm.c_str());
 #endif
 
@@ -1708,7 +1825,7 @@ void recompileNextInstruction(bool delayslot, bool swapped_delay_slot)
 		_clearNeededXMMregs();
 	}
 
-	s_pCode = (int*)PSM(pc);
+	s_pCode = static_cast<int*>(recGetMemPtr(pc));
 	pxAssert(s_pCode);
 
 #if 0
@@ -2074,7 +2191,7 @@ static void memory_protect_recompiled_code(u32 startpc, u32 size)
 
 			while (stg > 0)
 			{
-				xCMP(ptr32[PSM(lpc)], *(u32*)PSM(lpc));
+				xCMP(ptr32[PSM(lpc)], *static_cast<u32*>(PSM(lpc)));
 				xJNE(DispatchBlockDiscard);
 
 				stg -= 4;
@@ -2196,6 +2313,17 @@ static bool recSkipTimeoutLoop(s32 reg, bool is_timeout_loop)
 
 static void recRecompile(const u32 startpc)
 {
+	if (CHECK_FULLTLB)
+	{
+		if (const u32 excode = vtlb_GetFetchExceptionCode(startpc); excode != 0)
+		{
+			cpuRegs.pc = startpc + 4;
+			cpuRegs.branch = false;
+			cpuTlbMiss(startpc, false, excode);
+			return;
+		}
+	}
+
 	u32 i = 0;
 	u32 willbranch3 = 0;
 
@@ -2218,7 +2346,7 @@ static void recRecompile(const u32 startpc)
 	xSetPtr(recPtr);
 	recPtr = xGetAlignedCallTarget();
 
-	s_pCurBlock = PC_GETBLOCK(startpc);
+	s_pCurBlock = PC_GETBLOCK(HWADDR(startpc));
 
 	pxAssert(s_pCurBlock->GetFnptr() == (uptr)JITCompile);
 
@@ -2329,14 +2457,7 @@ static void recRecompile(const u32 startpc)
 
 	while (1)
 	{
-		BASEBLOCK* pblock = PC_GETBLOCK(i);
-
-		// stop before breakpoints
-		if (isBreakpointNeeded(i) != 0 || isMemcheckNeeded(i) != 0)
-		{
-			s_nEndBlock = i;
-			break;
-		}
+		BASEBLOCK* pblock = PC_GETBLOCK(HWADDR(i));
 
 		if (i != startpc) // Block size truncation checks.
 		{
@@ -2357,8 +2478,15 @@ static void recRecompile(const u32 startpc)
 			}
 		}
 
-		//HUH ? PSM ? whut ? THIS IS VIRTUAL ACCESS GOD DAMMIT
-		cpuRegs.code = *(int*)PSM(i);
+		// Check the page boundary before debugger lookups, since the following
+		// virtual page may not be mapped in full-TLB mode.
+		if (isBreakpointNeeded(i) != 0 || isMemcheckNeeded(i) != 0)
+		{
+			s_nEndBlock = i;
+			break;
+		}
+
+		cpuRegs.code = *static_cast<int*>(recGetMemPtr(i));
 
 		if (is_timeout_loop)
 		{
@@ -2484,7 +2612,7 @@ StartRecomp:
 		{
 			if (i == s_nEndBlock - 8)
 				continue;
-			cpuRegs.code = *(u32*)PSM(i);
+			cpuRegs.code = *static_cast<u32*>(recGetMemPtr(i));
 			// nop
 			if (cpuRegs.code == 0)
 				continue;
@@ -2573,7 +2701,23 @@ StartRecomp:
 
 		for (i = s_nEndBlock; i > startpc; i -= 4)
 		{
-			cpuRegs.code = *(int*)PSM(i - 4);
+			const u32 instruction_pc = i - 4;
+			const int* const instruction_ptr = static_cast<int*>(recGetMemPtr(instruction_pc));
+			if (!instruction_ptr)
+			{
+				const auto& entry = vtlb_private::vtlbdata.vmap[instruction_pc >> vtlb_private::VTLB_PAGE_BITS];
+				Console.Error("FULLTLB compile crossed unmapped page: start=%08x end=%08x pc=%08x "
+					"ASID=%02x handler=%u id=%u",
+					startpc, s_nEndBlock, instruction_pc, cpuRegs.CP0.n.EntryHi & 0xff,
+					entry.isHandler(instruction_pc), entry.isHandler(instruction_pc) ? entry.assumeHandlerGetID() : 0);
+				Host::ReportErrorAsync("R5900 Full-TLB Error",
+					fmt::format("Recompiler block {:08x}-{:08x} crossed an unmapped instruction at {:08x}.",
+						startpc, s_nEndBlock, instruction_pc));
+				VMManager::SetPaused(true);
+				recExitExecution();
+				return;
+			}
+			cpuRegs.code = *instruction_ptr;
 			pcur[-1] = pcur[0];
 			recBackpropBSC(cpuRegs.code, pcur - 1, pcur);
 			pcur--;
@@ -2613,7 +2757,12 @@ StartRecomp:
 #endif
 
 	// Detect and handle self-modified code
-	memory_protect_recompiled_code(startpc, (s_nEndBlock - startpc) >> 2);
+	// Full-TLB mappings can point a virtual code page at any RAM page and can be
+	// replaced without changing the virtual address. The legacy protection and
+	// overlap bookkeeping assumes a direct/identity address, so leave it off
+	// until it is made mapping-aware.
+	if (!CHECK_FULLTLB || startpc >= 0x80000000u)
+		memory_protect_recompiled_code(startpc, (s_nEndBlock - startpc) >> 2);
 
 	// Skip Recompilation if sceMpegIsEnd Pattern detected
 	const bool doRecompilation = !skipMPEG_By_Pattern(startpc) && !recSkipTimeoutLoop(timeout_reg, is_timeout_loop);
@@ -2628,7 +2777,7 @@ StartRecomp:
 			if (dump_block)
 			{
 				std::string disasm;
-				disR5900Fasm(disasm, *(u32*)PSM(pc), pc, false);
+				disR5900Fasm(disasm, *static_cast<u32*>(recGetMemPtr(pc)), pc, false);
 				fprintf(stderr, "Compiling %08X %s\n", pc, disasm.c_str());
 
 				const u8* inst_start = x86Ptr;
@@ -2673,7 +2822,7 @@ StartRecomp:
 	pxAssert((pc - startpc) >> 2 <= 0xffff);
 	s_pCurBlockEx->size = (pc - startpc) >> 2;
 
-	if (HWADDR(pc) <= Ps2MemSize::ExposedRam)
+	if ((!CHECK_FULLTLB || startpc >= 0x80000000u) && HWADDR(pc) <= Ps2MemSize::ExposedRam)
 	{
 		BASEBLOCKEX* oldBlock;
 		int i;
@@ -2763,6 +2912,219 @@ StartRecomp:
 
 	s_pCurBlock = nullptr;
 	s_pCurBlockEx = nullptr;
+}
+
+void recRegisterExceptionInformation()
+{
+	RecExceptionInfo info = {};
+	info.mips_pc = g_recompilingDelaySlot ? pc : pc - 4;
+	info.mips_code = cpuRegs.code;
+	info.mips_delay_slot = g_recompilingDelaySlot;
+
+	for (u32 i = 0; i < iREGCNT_GPR; i++)
+	{
+		const u8 type = x86regs[i].type;
+		const s8 reg = x86regs[i].reg;
+		if ((type == X86TYPE_GPR && reg > 0) || type == X86TYPE_FPRC || type == X86TYPE_VIREG)
+		{
+			info.gpr_info[i].type = type;
+			info.gpr_info[i].reg = static_cast<u8>(reg);
+		}
+	}
+
+	for (u32 i = 0; i < iREGCNT_XMM; i++)
+	{
+		const u8 type = xmmregs[i].type;
+		const s8 reg = xmmregs[i].reg;
+		if ((type == XMMTYPE_GPRREG && reg > 0) || type == XMMTYPE_FPREG ||
+			type == XMMTYPE_FPACC || (type == XMMTYPE_VFREG && reg > 0))
+		{
+			info.xmm_info[i].type = type;
+			info.xmm_info[i].reg = static_cast<u8>(reg);
+		}
+	}
+
+	for (u32 reg = 1; reg < 32; reg++)
+	{
+		if (GPR_IS_CONST1(reg) && _checkX86reg(X86TYPE_GPR, reg, 0) < 0)
+			info.constant_values.emplace_back(reg, g_cpuConstRegs[reg].UD[0]);
+	}
+
+	s_rec_exception_info.insert_or_assign(xGetPtr(), std::move(info));
+}
+
+static void recDoExceptionExit(void* rip, const u64* gprs, const u128* xmms, u32 excode)
+{
+	const auto it = s_rec_exception_info.find(rip);
+	if (it == s_rec_exception_info.end())
+	{
+		Host::ReportErrorAsync("R5900 Internal Error", fmt::format("Exception information for {} not found.", rip));
+		VMManager::SetPaused(true);
+		recExitExecution();
+		return;
+	}
+
+	const RecExceptionInfo& info = it->second;
+	for (u32 i = 0; i < iREGCNT_GPR; i++)
+	{
+		const u8 reg = info.gpr_info[i].reg;
+		switch (info.gpr_info[i].type)
+		{
+			case X86TYPE_GPR:
+				cpuRegs.GPR.r[reg].UD[0] = gprs[i];
+				break;
+			case X86TYPE_FPRC:
+				fpuRegs.fprc[reg] = static_cast<u32>(gprs[i]);
+				break;
+			case X86TYPE_VIREG:
+				VU0.VI[reg].US[0] = static_cast<u16>(gprs[i]);
+				break;
+			default:
+				break;
+		}
+	}
+
+	for (u32 i = 0; i < iREGCNT_XMM; i++)
+	{
+		const u8 reg = info.xmm_info[i].reg;
+		switch (info.xmm_info[i].type)
+		{
+			case XMMTYPE_GPRREG:
+				cpuRegs.GPR.r[reg].UQ = xmms[i];
+				break;
+			case XMMTYPE_FPREG:
+				fpuRegs.fpr[reg].UL = xmms[i]._u32[0];
+				break;
+			case XMMTYPE_FPACC:
+				fpuRegs.ACC.UL = xmms[i]._u32[0];
+				break;
+			case XMMTYPE_VFREG:
+				if (reg == 33)
+					VU0.VI[REG_I].UL = xmms[i]._u32[0];
+				else if (reg == 32)
+					VU0.ACC.UQ = xmms[i];
+				else
+					VU0.VF[reg].UQ = xmms[i];
+				break;
+			default:
+				break;
+		}
+	}
+
+	for (const auto& [reg, value] : info.constant_values)
+		cpuRegs.GPR.r[reg].UD[0] = value;
+
+	if (info.mips_pc >= 0x00477ac8 && info.mips_pc <= 0x00477b0c)
+	{
+		Console.Error("FULLTLB return-path fault: pc=%08x code=%08x addr=%08x ra=%08x sp=%08x t9=%08x",
+			info.mips_pc, info.mips_code,
+			cpuRegs.GPR.r[(info.mips_code >> 21) & 0x1f].UL[0] + static_cast<u32>(static_cast<s16>(info.mips_code)),
+			cpuRegs.GPR.r[31].UL[0], cpuRegs.GPR.r[29].UL[0], cpuRegs.GPR.r[25].UL[0]);
+		for (u32 i = 0; i < iREGCNT_GPR; i++)
+		{
+			if (info.gpr_info[i].reg == 31)
+				Console.Error("FULLTLB ra source: host_gpr=%u type=%u value=%llx", i,
+					info.gpr_info[i].type, static_cast<unsigned long long>(gprs[i]));
+		}
+		for (u32 i = 0; i < iREGCNT_XMM; i++)
+		{
+			if (info.xmm_info[i].reg == 31)
+				Console.Error("FULLTLB ra source: host_xmm=%u type=%u lo=%llx", i,
+					info.xmm_info[i].type, static_cast<unsigned long long>(xmms[i]._u64[0]));
+		}
+	}
+
+	const u32 rs = (info.mips_code >> 21) & 0x1f;
+	const s32 displacement = static_cast<s16>(info.mips_code);
+	const u32 address = cpuRegs.GPR.r[rs].UL[0] + static_cast<u32>(displacement);
+	recTraceFullTLBException(info, rip, address, excode);
+	if ((cpuRegs.CP0.n.EntryHi & 0xff) != 0)
+	{
+		static u32 userspace_exception_count = 0;
+		if (userspace_exception_count++ < 512)
+		{
+			Console.Error("FULLTLB user-sequence #%u: pc=%08x code=%08x excode=%08x bd=%u addr=%08x "
+				"ASID=%02x EntryHi=%08x Status=%08x EPC=%08x",
+				userspace_exception_count, info.mips_pc, info.mips_code, excode,
+				info.mips_delay_slot, address, cpuRegs.CP0.n.EntryHi & 0xff,
+				cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.EPC);
+		}
+	}
+	if (info.mips_pc == 0x00480568 || address < 0x1000)
+	{
+		Console.Error("FULLTLB low-address fault: rip=%p pc=%08x code=%08x excode=%08x bd=%u addr=%08x",
+			rip, info.mips_pc, info.mips_code, excode, info.mips_delay_slot, address);
+		for (u32 i = 0; i < 32; i += 4)
+			Console.Error("FULLTLB GPR r%u=%08x r%u=%08x r%u=%08x r%u=%08x", i,
+				cpuRegs.GPR.r[i].UL[0], i + 1, cpuRegs.GPR.r[i + 1].UL[0], i + 2,
+				cpuRegs.GPR.r[i + 2].UL[0], i + 3, cpuRegs.GPR.r[i + 3].UL[0]);
+	}
+	if (excode == EXC_CODE_Mod && (address & ~0xfffu) == 0x00582000)
+	{
+		static u32 modified_trace_count = 0;
+		if (modified_trace_count++ < 32)
+		{
+			Console.Error("FULLTLB modified #%u: rip=%p pc=%08x code=%08x addr=%08x base=r%u=%08x value=r%u=%08x "
+				"EntryHi=%08x Status=%08x Cause=%08x EPC=%08x",
+				modified_trace_count, rip, info.mips_pc, info.mips_code, address, rs,
+				cpuRegs.GPR.r[rs].UL[0], (info.mips_code >> 16) & 0x1f,
+				cpuRegs.GPR.r[(info.mips_code >> 16) & 0x1f].UL[0], cpuRegs.CP0.n.EntryHi,
+				cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause, cpuRegs.CP0.n.EPC);
+		}
+	}
+	cpuRegs.pc = info.mips_pc + 4;
+	cpuRegs.branch = info.mips_delay_slot;
+	if ((excode & ~EXC_CODE_TLB_INVALID) == EXC_CODE_TLBL ||
+		(excode & ~EXC_CODE_TLB_INVALID) == EXC_CODE_TLBS || excode == EXC_CODE_Mod)
+	{
+		cpuTlbMiss(address, info.mips_delay_slot, excode);
+		if (info.mips_pc == 0x00406150 && address == 0x00580318)
+		{
+			Console.Error("FULLTLB CP0 after: EntryHi=%08x Status=%08x Cause=%08x EPC=%08x BadVAddr=%08x next_pc=%08x",
+				cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause,
+				cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.BadVAddr, cpuRegs.pc);
+		}
+	}
+	else
+	{
+		cpuRegs.CP0.n.BadVAddr = address;
+		cpuRegs.pc -= 4;
+		cpuException(excode, info.mips_delay_slot);
+	}
+
+	recExitExecution();
+}
+
+u8* recGenerateDynamicExceptionExit(u32 return_offset, u32 excode)
+{
+	u8* const result = xGetPtr();
+
+#ifdef _WIN32
+	constexpr u32 shadow_size = 32;
+#else
+	constexpr u32 shadow_size = 0;
+#endif
+	constexpr u32 gpr_size = iREGCNT_GPR * 8;
+	constexpr u32 xmm_size = iREGCNT_XMM * 16;
+	constexpr u32 stack_size = gpr_size + xmm_size + shadow_size + 16;
+	constexpr s32 base = shadow_size + 8;
+
+	xSUB(rsp, stack_size);
+	for (u32 i = 0; i < iREGCNT_GPR; i++)
+	{
+		if (static_cast<int>(i) != rsp.GetId())
+			xMOV(ptr64[rsp + base + static_cast<s32>(i * 8)], xRegister64(i));
+	}
+	for (u32 i = 0; i < iREGCNT_XMM; i++)
+		xMOVAPS(ptr128[rsp + base + static_cast<s32>(gpr_size + i * 16)], xRegisterSSE(i));
+
+	xMOV(arg1reg, ptr64[rsp + stack_size + return_offset]);
+	xLEA(arg2reg, ptr64[rsp + base]);
+	xLEA(arg3reg, ptr64[rsp + base + static_cast<s32>(gpr_size)]);
+	xMOV(xRegister32(arg4reg.GetId()), excode);
+	xLEA(rax, ptr64[reinterpret_cast<void*>(&recDoExceptionExit)]);
+	xJMP(rax);
+	return result;
 }
 
 R5900cpu recCpu = {

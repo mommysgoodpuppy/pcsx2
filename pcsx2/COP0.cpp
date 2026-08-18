@@ -226,9 +226,6 @@ __fi void COP0_UpdatePCCR()
 
 void MapTLB(const tlbs& t, int i)
 {
-	u32 mask, addr;
-	u32 saddr, eaddr;
-
 	COP0_LOG("MAP TLB %d: 0x%08X-> [0x%08X 0x%08X] S=%d G=%d ASID=%d Mask=0x%03X EntryLo0 PFN=%x EntryLo0 Cache=%x EntryLo1 PFN=%x EntryLo1 Cache=%x VPN2=%x",
 		i, t.VPN2(), t.PFN0(), t.PFN1(), t.isSPR() >> 31, t.isGlobal(), t.EntryHi.ASID,
 		t.Mask(), t.EntryLo0.PFN, t.EntryLo0.C, t.EntryLo1.PFN, t.EntryLo1.C, t.VPN2());
@@ -243,40 +240,77 @@ void MapTLB(const tlbs& t, int i)
 			Console.Warning("COP0: Mapping Scratchpad to non-default address 0x%08X", t.VPN2());
 
 		vtlb_VMapBuffer(t.VPN2(), eeMem->Scratch, Ps2MemSize::Scratch);
+		return;
 	}
-	else
+
+	if (!t.isGlobal() && t.EntryHi.ASID != (cpuRegs.CP0.n.EntryHi & 0xff))
+		return;
+
+	const auto map_half = [&t, i](bool valid, bool writable, u32 pfn, u32 saddr) {
+		const u32 mask = ((~t.Mask()) << 1) & 0xfffff;
+		const u32 eaddr = saddr + t.Mask() + 1;
+		for (u32 addr = saddr; addr < eaddr; addr++)
+		{
+			if ((addr & mask) != ((t.VPN2() >> 12) & mask))
+				continue;
+
+			const u32 vaddr = addr << 12;
+			if (CHECK_FULLTLB && (vaddr == 0x00580000 || vaddr == 0x00582000))
+			{
+				static u32 trace_count = 0;
+				if (trace_count++ < 64)
+					Console.Error("FULLTLB map target #%u: tlb=%d valid=%u dirty=%u vaddr=%08x paddr=%08x entry_asid=%02x current_asid=%02x",
+						trace_count, i, valid, writable, vaddr, pfn + ((addr - saddr) << 12),
+						t.EntryHi.ASID, cpuRegs.CP0.n.EntryHi & 0xff);
+			}
+			if (!valid && vtlb_VMapIsMapped(vaddr))
+				continue;
+
+			if (valid)
+				vtlb_VMap(vaddr, pfn + ((addr - saddr) << 12), 0x1000, writable);
+			else
+				vtlb_VMapInvalid(vaddr, 0x1000);
+
+			Cpu->Clear(vaddr, 0x400);
+		}
+	};
+
+	if (t.EntryLo0.V || CHECK_FULLTLB)
+		map_half(t.EntryLo0.V, t.EntryLo0.D, t.PFN0(), t.VPN2() >> 12);
+	if (t.EntryLo1.V || CHECK_FULLTLB)
+		map_half(t.EntryLo1.V, t.EntryLo1.D, t.PFN1(), (t.VPN2() >> 12) + t.Mask() + 1);
+}
+
+void RemapAllTLBs()
+{
+	for (u32 i = 0; i < std::size(tlb); i++)
+		UnmapTLB(tlb[i], i);
+	for (u32 i = 0; i < std::size(tlb); i++)
+		MapTLB(tlb[i], i);
+}
+
+void COP0_WriteEntryHi(u32 value)
+{
+	const u8 old_asid = cpuRegs.CP0.n.EntryHi & 0xff;
+	const u8 new_asid = value & 0xff;
+	if (old_asid == new_asid)
 	{
-		if (t.EntryLo0.V)
-		{
-			mask = ((~t.Mask()) << 1) & 0xfffff;
-			saddr = t.VPN2() >> 12;
-			eaddr = saddr + t.Mask() + 1;
+		cpuRegs.CP0.n.EntryHi = value;
+		return;
+	}
 
-			for (addr = saddr; addr < eaddr; addr++)
-			{
-				if ((addr & mask) == ((t.VPN2() >> 12) & mask))
-				{ //match
-					memSetPageAddr(addr << 12, t.PFN0() + ((addr - saddr) << 12));
-					Cpu->Clear(addr << 12, 0x400);
-				}
-			}
-		}
+	for (u32 i = 0; i < std::size(tlb); i++)
+	{
+		if (!tlb[i].isGlobal() && tlb[i].EntryHi.ASID == old_asid)
+			UnmapTLB(tlb[i], i);
+	}
 
-		if (t.EntryLo1.V)
-		{
-			mask = ((~t.Mask()) << 1) & 0xfffff;
-			saddr = (t.VPN2() >> 12) + t.Mask() + 1;
-			eaddr = saddr + t.Mask() + 1;
+	cpuRegs.CP0.n.EntryHi = value;
 
-			for (addr = saddr; addr < eaddr; addr++)
-			{
-				if ((addr & mask) == ((t.VPN2() >> 12) & mask))
-				{ //match
-					memSetPageAddr(addr << 12, t.PFN1() + ((addr - saddr) << 12));
-					Cpu->Clear(addr << 12, 0x400);
-				}
-			}
-		}
+	for (u32 i = 0; i < std::size(tlb); i++)
+	{
+		if (!tlb[i].isGlobal() && tlb[i].EntryHi.ASID == new_asid)
+			MapTLB(tlb[i], i);
 	}
 }
 
@@ -292,45 +326,36 @@ __inline u32 ConvertPageMask(const u32 PageMask)
 void UnmapTLB(const tlbs& t, int i)
 {
 	//Console.WriteLn("Clear TLB %d: %08x-> [%08x %08x] S=%d G=%d ASID=%d Mask= %03X", i,t.VPN2,t.PFN0,t.PFN1,t.S,t.G,t.ASID,t.Mask);
-	u32 mask, addr;
-	u32 saddr, eaddr;
-
 	if (t.isSPR())
 	{
+		Cpu->Clear(t.VPN2(), 0x1000);
 		vtlb_VMapUnmap(t.VPN2(), 0x4000);
 		return;
 	}
 
-	if (t.EntryLo0.V)
-	{
-		mask = ((~t.Mask()) << 1) & 0xfffff;
-		saddr = t.VPN2() >> 12;
-		eaddr = saddr + t.Mask() + 1;
-		//	Console.WriteLn("Clear TLB: %08x ~ %08x",saddr,eaddr-1);
-		for (addr = saddr; addr < eaddr; addr++)
+	const auto unmap_half = [&t](bool valid, u32 saddr) {
+		const u32 mask = ((~t.Mask()) << 1) & 0xfffff;
+		const u32 eaddr = saddr + t.Mask() + 1;
+		for (u32 addr = saddr; addr < eaddr; addr++)
 		{
-			if ((addr & mask) == ((t.VPN2() >> 12) & mask))
-			{ //match
-				memClearPageAddr(addr << 12);
-				Cpu->Clear(addr << 12, 0x400);
-			}
-		}
-	}
+			if ((addr & mask) != ((t.VPN2() >> 12) & mask))
+				continue;
 
-	if (t.EntryLo1.V)
-	{
-		mask = ((~t.Mask()) << 1) & 0xfffff;
-		saddr = (t.VPN2() >> 12) + t.Mask() + 1;
-		eaddr = saddr + t.Mask() + 1;
-		//	Console.WriteLn("Clear TLB: %08x ~ %08x",saddr,eaddr-1);
-		for (addr = saddr; addr < eaddr; addr++)
-		{
-			if ((addr & mask) == ((t.VPN2() >> 12) & mask))
-			{ //match
-				memClearPageAddr(addr << 12);
-				Cpu->Clear(addr << 12, 0x400);
+			const u32 vaddr = addr << 12;
+			if (valid || vtlb_VMapIsInvalid(vaddr))
+			{
+				Cpu->Clear(vaddr, 0x400);
+				vtlb_VMapUnmap(vaddr, 0x1000);
 			}
 		}
+	};
+
+	if (t.isGlobal() || t.EntryHi.ASID == (cpuRegs.CP0.n.EntryHi & 0xff))
+	{
+		if (t.EntryLo0.V || CHECK_FULLTLB)
+			unmap_half(t.EntryLo0.V, t.VPN2() >> 12);
+		if (t.EntryLo1.V || CHECK_FULLTLB)
+			unmap_half(t.EntryLo1.V, (t.VPN2() >> 12) + t.Mask() + 1);
 	}
 
 	for (size_t i = 0; i < cachedTlbs.count; i++)
@@ -438,20 +463,21 @@ namespace COP0 {
 
 	void TLBWR()
 	{
-		const u8 j = cpuRegs.CP0.n.Random & 0x3f;
+		const u8 wired = std::min<u8>(cpuRegs.CP0.n.Wired & 0x3f, 47);
+		u8 j = cpuRegs.CP0.n.Random & 0x3f;
+		if (j < wired || j > 47)
+			j = 47;
 
-		if (j > 47)
-		{
-			Console.Warning("TLBWR with random > 47! (%d)", j);
-			return;
-		}
-
-		DevCon.Warning("COP0_TLBWR %d:%x,%x,%x,%x\n",
-			cpuRegs.CP0.n.Random, cpuRegs.CP0.n.PageMask, cpuRegs.CP0.n.EntryHi,
+		// Linux refills the TLB constantly, so an unconditional warning here is
+		// thousands of console writes a second. Route it through the COP0 log
+		// source like the other TLB instructions.
+		COP0_LOG("COP0_TLBWR %d:%x,%x,%x,%x",
+			j, cpuRegs.CP0.n.PageMask, cpuRegs.CP0.n.EntryHi,
 			cpuRegs.CP0.n.EntryLo0, cpuRegs.CP0.n.EntryLo1);
 
 		UnmapTLB(tlb[j], j);
 		WriteTLB(j);
+		cpuRegs.CP0.n.Random = (j == wired) ? 47 : j - 1;
 	}
 
 	void TLBP()
@@ -475,7 +501,9 @@ namespace COP0 {
 		cpuRegs.CP0.n.Index = 0xFFFFFFFF;
 		for (i = 0; i < 48; i++)
 		{
-			if (tlb[i].VPN2() == ((~tlb[i].Mask()) & (EntryHi32.s.VPN2)) && ((tlb[i].isGlobal()) || ((tlb[i].EntryHi.ASID & 0xff) == EntryHi32.s.ASID)))
+			const u32 mask = ~tlb[i].Mask();
+			if ((tlb[i].EntryHi.VPN2 & mask) == (EntryHi32.s.VPN2 & mask) &&
+				(tlb[i].isGlobal() || tlb[i].EntryHi.ASID == EntryHi32.s.ASID))
 			{
 				cpuRegs.CP0.n.Index = i;
 				break;

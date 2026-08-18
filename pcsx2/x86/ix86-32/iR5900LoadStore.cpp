@@ -71,7 +71,7 @@ static void recLoadQuad(u32 bits, bool sign)
 		alloc_cb = []() { return _allocGPRtoXMMreg(_Rt_, MODE_WRITE); };
 
 	int xmmreg;
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		const u32 srcadr = (g_cpuConstRegs[_Rs_].UL[0] + _Imm_) & ~0x0f;
 		xmmreg = vtlb_DynGenReadQuad_Const(bits, srcadr, _Rt_ ? alloc_cb : nullptr);
@@ -110,7 +110,7 @@ static void recLoad(u32 bits, bool sign)
 
 	int x86reg;
 	bool needs_flush = false;
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		const u32 srcadr = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 
@@ -168,7 +168,7 @@ static void recStore(u32 bits)
 	// Load ECX with the destination address, or issue a direct optimized write
 	// if the address is a constant propagation.
 
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		u32 dstadr = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 		if (bits == 128)
@@ -264,7 +264,10 @@ void recSD()
 }
 void recSQ()
 {
-	recStore(128);
+	if (CHECK_FULLTLB)
+		recBranchCall(Interpreter::OpcodeImpl::SQ);
+	else
+		recStore(128);
 	EE::Profiler.EmitOp(eeOpcode::SQ);
 }
 
@@ -602,7 +605,7 @@ void recLDL()
 	_freeX86reg(edx);
 	_freeX86reg(arg1regd);
 
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		u32 srcadr = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 
@@ -630,7 +633,7 @@ void recLDL()
 
 	const xRegister64 treg(_allocX86reg(X86TYPE_GPR, _Rt_, MODE_READ | MODE_WRITE));
 
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		u32 shift = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 		shift = ((shift & 0x7) + 1) * 8;
@@ -689,7 +692,7 @@ void recLDR()
 	_freeX86reg(edx);
 	_freeX86reg(arg1regd);
 
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		u32 srcadr = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 
@@ -717,7 +720,7 @@ void recLDR()
 
 	const xRegister64 treg(_allocX86reg(X86TYPE_GPR, _Rt_, MODE_READ | MODE_WRITE));
 
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		u32 shift = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 		shift = (shift & 0x7) * 8;
@@ -797,7 +800,7 @@ void recSDL()
 	_freeX86reg(ecx);
 	_freeX86reg(arg2regd);
 
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		u32 adr = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 		u32 aligned = adr & ~0x07;
@@ -884,7 +887,7 @@ void recSDR()
 	_freeX86reg(ecx);
 	_freeX86reg(arg2regd);
 
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		u32 adr = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 		u32 aligned = adr & ~0x07;
@@ -973,7 +976,7 @@ void recLWC1()
 #else
 
 	const vtlb_ReadRegAllocCallback alloc_cb = []() { return _allocFPtoXMMreg(_Rt_, MODE_WRITE); };
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		const u32 addr = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 		vtlb_DynGenReadNonQuad_Const(32, false, true, addr, alloc_cb);
@@ -1000,7 +1003,7 @@ void recSWC1()
 	recCall(::R5900::Interpreter::OpcodeImpl::SWC1);
 #else
 	const int regt = _allocFPtoXMMreg(_Rt_, MODE_READ);
-	if (GPR_IS_CONST1(_Rs_))
+	if (GPR_IS_CONST1(_Rs_) && !CHECK_FULLTLB)
 	{
 		const u32 addr = g_cpuConstRegs[_Rs_].UL[0] + _Imm_;
 		vtlb_DynGenWrite_Const(32, true, addr, regt);

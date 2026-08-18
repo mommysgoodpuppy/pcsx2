@@ -65,6 +65,7 @@ void cpuReset()
 
 	cpuRegs.pc				= 0xbfc00000; //set pc reg to stack
 	cpuRegs.CP0.n.Config	= 0x440;
+	cpuRegs.CP0.n.Random = 47;
 	cpuRegs.CP0.n.Status.val= 0x70400004; //0x10900000 <-- wrong; // COP0 enabled | BEV = 1 | TS = 1
 	cpuRegs.CP0.n.PRid		= 0x00002e20; // PRevID = Revision ID, same as R5900
 	fpuRegs.fprc[0]			= 0x00002e30; // fpu Revision..
@@ -105,7 +106,7 @@ __ri void cpuException(u32 code, u32 bd)
 		errLevel2 = false;
 		checkStatus = (cpuRegs.CP0.n.Status.b.BEV == 0); //  for TLB/general exceptions
 
-		if (((code & 0x7C) >= 0x8) && ((code & 0x7C) <= 0xC))
+		if (((code & 0x1007C) >= 0x8) && ((code & 0x1007C) <= 0xC))
 			offset = 0x0; //TLB Refill
 		else if ((code & 0x7C) == 0x0)
 			offset = 0x200; //Interrupt
@@ -140,7 +141,9 @@ __ri void cpuException(u32 code, u32 bd)
 		cpuRegs.CP0.n.Status.b.EXL = 1;
 		if (bd)
 		{
-			Console.Warning("branch delay!!");
+			// Routine under Linux, which takes TLB refill exceptions in delay
+			// slots constantly; an unconditional warning floods the console.
+			COP0_LOG("exception in branch delay slot, pc=%x", cpuRegs.pc);
 			cpuRegs.CP0.n.EPC = cpuRegs.pc - 4;
 			cpuRegs.CP0.n.Cause |= 0x80000000;
 		}
@@ -166,10 +169,14 @@ __ri void cpuException(u32 code, u32 bd)
 
 void cpuTlbMiss(u32 addr, u32 bd, u32 excode)
 {
-	// Avoid too much spamming on the interpreter
-	if (Cpu != &intCpu || IsDebugBuild) {
+	// TLB faults are routine under Linux. Keep a small diagnostic sample without
+	// turning a single boot into a multi-gigabyte log.
+	static u32 logged_tlb_misses = 0;
+	if ((Cpu != &intCpu || IsDebugBuild) && logged_tlb_misses < 64) {
 		Console.Error("cpuTlbMiss pc:%x, cycl:%llx, addr: %x, status=%x, code=%x",
 				cpuRegs.pc, cpuRegs.cycle, addr, cpuRegs.CP0.n.Status.val, excode);
+		if (++logged_tlb_misses == 64)
+			Console.Error("cpuTlbMiss: further faults suppressed");
 	}
 
 	cpuRegs.CP0.n.BadVAddr = addr;

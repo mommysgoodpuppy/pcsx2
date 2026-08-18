@@ -487,6 +487,7 @@ static __fi void DoFMVSwitch()
 static __fi void VSyncStart(u64 sCycle)
 {
 	// End-of-frame tasks.
+	eeSIOFlushPending();
 	DoFMVSwitch();
 	VMManager::Internal::VSyncOnCPUThread();
 

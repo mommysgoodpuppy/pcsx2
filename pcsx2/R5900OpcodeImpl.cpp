@@ -259,7 +259,20 @@ void COP2()
 }
 
 void Unknown() {
-	CPU_LOG("%8.8lx: Unknown opcode called", cpuRegs.pc);
+	if (CHECK_FULLTLB)
+	{
+		const u32 base = (cpuRegs.code >> 21) & 0x1f;
+		const u32 rt = (cpuRegs.code >> 16) & 0x1f;
+		if ((cpuRegs.code & 0xfc000000) == 0xc0000000 || (cpuRegs.code & 0xfc000000) == 0xe0000000)
+			Console.Error("LLSC trap pc=%08x code=%08x base=%08x rt=%08x", cpuRegs.pc - 4, cpuRegs.code,
+				cpuRegs.GPR.r[base].UL[0], cpuRegs.GPR.r[rt].UL[0]);
+		cpuRegs.pc -= 4;
+		cpuException(EXC_CODE_Ri, cpuRegs.branch);
+	}
+	else
+	{
+		CPU_LOG("%8.8lx: Unknown opcode called", cpuRegs.pc);
+	}
 }
 
 void MMI_Unknown() { Console.Warning("Unknown MMI opcode called"); }
@@ -871,11 +884,18 @@ void SDR()
 
 void SQ()
 {
-	// MIPS Note: LQ and SQ are special and "silently" align memory addresses, thus
-	// an address error due to unaligned access isn't possible like it is on other loads/stores.
-
+	// SQ requires 16-byte alignment on the R5900. This also lets Linux trap and
+	// emulate RDHWR encodings, which overlap with misaligned SQ instructions.
 	u32 addr = cpuRegs.GPR.r[_Rs_].UL[0] + _Imm_;
-	memWrite128(addr & ~0xf, cpuRegs.GPR.r[_Rt_].UQ);
+	if (addr & 0xf)
+	{
+		cpuRegs.CP0.n.BadVAddr = addr;
+		cpuRegs.pc -= 4;
+		cpuException(EXC_CODE_AdES, cpuRegs.branch);
+		return;
+	}
+
+	memWrite128(addr, cpuRegs.GPR.r[_Rt_].UQ);
 }
 
 /*********************************************************

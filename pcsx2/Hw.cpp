@@ -21,6 +21,20 @@ int rdram_sdevid = 0;
 std::deque<u8> ee_sio_rx_fifo;
 std::deque<u8> ee_sio_tx_fifo;
 
+// ps2sdk's sio_putsn() emits no trailing newline, so the tail of a message sits
+// in the FIFO until some later newline arrives, and is lost outright if the VM
+// stops first. kloader reports all of its errors this way. Flush whatever is
+// pending once per frame so those messages actually reach the log.
+void eeSIOFlushPending()
+{
+	if (ee_sio_tx_fifo.empty())
+		return;
+
+	std::string output_string(ee_sio_tx_fifo.begin(), ee_sio_tx_fifo.end());
+	eeConLog(ShiftJIS_ConvertString(output_string.c_str()));
+	ee_sio_tx_fifo.clear();
+}
+
 void hwReset()
 {
 	std::memset(eeHw, 0, sizeof(eeHw));

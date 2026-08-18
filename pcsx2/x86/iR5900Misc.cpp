@@ -169,8 +169,10 @@ void recNULL()
 ////////////////////////////////////////////////////
 void recUnknown()
 {
-	// TODO : Unknown ops should throw an exception.
-	Console.Error("EE: Unrecognized op %x", cpuRegs.code);
+	if (CHECK_FULLTLB)
+		recBranchCall(R5900::Interpreter::OpcodeImpl::Unknown);
+	else
+		Console.Error("EE: Unrecognized op %x", cpuRegs.code);
 }
 
 void recMMI_Unknown()

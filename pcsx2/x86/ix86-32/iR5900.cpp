@@ -3043,10 +3043,15 @@ void recRegisterExceptionInformation()
 	info.mips_code = cpuRegs.code;
 	info.mips_delay_slot = g_recompilingDelaySlot;
 
+	// Freeing a register only clears inuse, so a stale type/reg left behind (every
+	// caller-saved register, after the flush before the vtlb call) would otherwise
+	// "restore" whatever the call left in it over the guest register.
 	for (u32 i = 0; i < iREGCNT_GPR; i++)
 	{
 		const u8 type = x86regs[i].type;
 		const s8 reg = x86regs[i].reg;
+		if (!x86regs[i].inuse)
+			continue;
 		if ((type == X86TYPE_GPR && reg > 0) || type == X86TYPE_FPRC || type == X86TYPE_VIREG)
 		{
 			info.gpr_info[i].type = type;
@@ -3058,6 +3063,8 @@ void recRegisterExceptionInformation()
 	{
 		const u8 type = xmmregs[i].type;
 		const s8 reg = xmmregs[i].reg;
+		if (!xmmregs[i].inuse)
+			continue;
 		if ((type == XMMTYPE_GPRREG && reg > 0) || type == XMMTYPE_FPREG ||
 			type == XMMTYPE_FPACC || (type == XMMTYPE_VFREG && reg > 0))
 		{

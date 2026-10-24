@@ -54,24 +54,50 @@ u32 maxrecmem = 0;
 alignas(16) static uptr recLUT[_64kb];
 alignas(16) static u32 hwLUT[_64kb];
 
+// Full TLB: the guest TLB translates kuseg and kseg2/kseg3 (kernel modules and
+// vmalloc live at 0xC0000000+); only kseg0/kseg1 are fixed windows onto RAM.
+static __fi bool recIsTlbMapped(u32 addr)
+{
+	return CHECK_FULLTLB && (addr < 0x80000000u || addr >= 0xC0000000u);
+}
+
 static __fi u32 HWADDR(u32 mem)
 {
-	if (CHECK_FULLTLB && (cpuRegs.CP0.n.EntryHi & 0xff) != 0 && mem < 0x80000000u &&
-		vtlb_private::vtlbdata.ppmap)
+	// Full TLB: key TLB-mapped code by the physical page it is mapped to right now,
+	// read straight from the vmap's host pointer. This used to go through
+	// vtlb_V2P(), but ppmap only exists for the Goemon gamefix, so it silently
+	// fell back to virtual == physical: every process sharing a virtual address
+	// (busybox and dropbear both at 0x400000) shared compiled blocks and links.
+	if (recIsTlbMapped(mem))
 	{
 		const auto& entry = vtlb_private::vtlbdata.vmap[mem >> vtlb_private::VTLB_PAGE_BITS];
 		if (!entry.isHandler(mem))
-			return vtlb_V2P(mem);
+		{
+			const uptr offset = entry.assumePtr(mem) - reinterpret_cast<uptr>(eeMem->Main);
+			if (offset < Ps2MemSize::ExposedRam)
+				return static_cast<u32>(offset);
+		}
 	}
 
 	return hwLUT[mem >> 16] + mem;
 }
 
+static u32 s_nBlockVirtStart = 0; // virtual pc of the block being recompiled
+
+// Full TLB: a direct link bakes in the physical page the target is mapped to at
+// compile time. That only stays true for the block's own page (a remap of it
+// moves this block too); any other TLB-mapped page may be remapped to a different
+// process's code later, so those exits go through the dispatcher.
+static __fi bool recLinkNeedsDispatch(u32 target)
+{
+	return recIsTlbMapped(target) && (target >> 12) != (s_nBlockVirtStart >> 12);
+}
+
 static __fi void* recGetMemPtr(u32 vaddr)
 {
-	// kuseg is translated by the guest TLB. Kernel segments retain the direct
+	// kuseg and kseg2/3 are translated by the guest TLB. kseg0/kseg1 retain the direct
 	// physical mapping expected by the existing recompiler bookkeeping.
-	return (CHECK_FULLTLB && vaddr < 0x80000000u) ? vtlb_GetVirtualPtr(vaddr) : PSM(vaddr);
+	return recIsTlbMapped(vaddr) ? vtlb_GetVirtualPtr(vaddr) : PSM(vaddr);
 }
 
 u32 s_nBlockCycles = 0; // cycles of current block recompiling
@@ -473,7 +499,8 @@ static const void* UnmappedRecLUTPage = nullptr;
 
 static uptr recGetDispatchBlock(u32 addr)
 {
-	if (CHECK_FULLTLB && (cpuRegs.CP0.n.EntryHi & 0xff) != 0 && addr < 0x80000000u)
+	// No ASID != 0 shortcut: Linux hands out ASID 0 again after the counter wraps.
+	if (recIsTlbMapped(addr))
 	{
 		const auto& entry = vtlb_private::vtlbdata.vmap[addr >> vtlb_private::VTLB_PAGE_BITS];
 		if (entry.isHandler(addr))
@@ -1522,7 +1549,7 @@ static void iBranchTest(u32 newpc)
 		xMOV(ptr64[&cpuRegs.cycle], rax); // update cycles
 		xSUB(rax, ptr64[&cpuRegs.nextEventCycle]);
 
-		if (newpc == 0xffffffff)
+		if (newpc == 0xffffffff || recLinkNeedsDispatch(newpc))
 			xJS(DispatcherReg);
 		else
 			recBlocks.Link(HWADDR(newpc), xJcc32(Jcc_Signed));
@@ -2303,7 +2330,10 @@ static bool recSkipTimeoutLoop(s32 reg, bool is_timeout_loop)
 	xMOV(ptr32[&cpuRegs.GPR.r[reg].UL[0]], edx); // write back new value of v0
 	xJNZ((void*)DispatcherEvent); // jump to dispatcher if new v0 is not zero (i.e. an event)
 	xMOV(ptr32[&cpuRegs.pc], s_nEndBlock); // otherwise end of loop
-	recBlocks.Link(HWADDR(s_nEndBlock), xJcc32());
+	if (recLinkNeedsDispatch(s_nEndBlock))
+		xJMP(DispatcherReg);
+	else
+		recBlocks.Link(HWADDR(s_nEndBlock), xJcc32());
 
 	g_branch = 1;
 	pc = s_nEndBlock;
@@ -2346,6 +2376,7 @@ static void recRecompile(const u32 startpc)
 	xSetPtr(recPtr);
 	recPtr = xGetAlignedCallTarget();
 
+	s_nBlockVirtStart = startpc;
 	s_pCurBlock = PC_GETBLOCK(HWADDR(startpc));
 
 	pxAssert(s_pCurBlock->GetFnptr() == (uptr)JITCompile);
@@ -2761,7 +2792,7 @@ StartRecomp:
 	// replaced without changing the virtual address. The legacy protection and
 	// overlap bookkeeping assumes a direct/identity address, so leave it off
 	// until it is made mapping-aware.
-	if (!CHECK_FULLTLB || startpc >= 0x80000000u)
+	if (!recIsTlbMapped(startpc))
 		memory_protect_recompiled_code(startpc, (s_nEndBlock - startpc) >> 2);
 
 	// Skip Recompilation if sceMpegIsEnd Pattern detected
@@ -2822,7 +2853,7 @@ StartRecomp:
 	pxAssert((pc - startpc) >> 2 <= 0xffff);
 	s_pCurBlockEx->size = (pc - startpc) >> 2;
 
-	if ((!CHECK_FULLTLB || startpc >= 0x80000000u) && HWADDR(pc) <= Ps2MemSize::ExposedRam)
+	if (!recIsTlbMapped(startpc) && HWADDR(pc) <= Ps2MemSize::ExposedRam)
 	{
 		BASEBLOCKEX* oldBlock;
 		int i;
@@ -2889,7 +2920,10 @@ StartRecomp:
 			{
 				xMOV(ptr32[&cpuRegs.pc], pc);
 				xADD(ptr64[&cpuRegs.cycle], scaleblockcycles());
-				recBlocks.Link(HWADDR(pc), xJcc32());
+				if (recLinkNeedsDispatch(pc))
+					xJMP(DispatcherReg);
+				else
+					recBlocks.Link(HWADDR(pc), xJcc32());
 			}
 		}
 	}

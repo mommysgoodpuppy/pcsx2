@@ -2467,7 +2467,14 @@ static void recRecompile(const u32 startpc)
 
 	pxAssert(s_pCurBlockEx);
 
-	if (HWADDR(startpc) == EELOAD_START)
+	// Under full TLB, EELOAD runs at its virtual address and HWADDR() folds kseg0
+	// onto it too: a guest kernel block at 0x80082000 would match, and the hook's
+	// memRead32 of a TLB-mapped address would fault from C++ into the JIT-only
+	// exception exit. Compare virtual addresses there, as the interpreter does.
+	const u32 hook_pc = CHECK_FULLTLB ? startpc : HWADDR(startpc);
+	const auto hook_addr = [](u32 addr) { return CHECK_FULLTLB ? addr : HWADDR(addr); };
+
+	if (hook_pc == EELOAD_START)
 	{
 		// The EELOAD _start function is the same across all BIOS versions
 		const u32 mainjump = memRead32(EELOAD_START + 0x9c);
@@ -2475,7 +2482,7 @@ static void recRecompile(const u32 startpc)
 			g_eeloadMain = ((EELOAD_START + 0xa0) & 0xf0000000U) | (mainjump << 2 & 0x0fffffffU);
 	}
 
-	if (g_eeloadMain && HWADDR(startpc) == HWADDR(g_eeloadMain))
+	if (g_eeloadMain && hook_pc == hook_addr(g_eeloadMain))
 	{
 		xFastCall((void*)eeloadHook);
 		if (VMManager::Internal::IsFastBootInProgress())
@@ -2495,7 +2502,7 @@ static void recRecompile(const u32 startpc)
 		}
 	}
 
-	if (g_eeloadExec && HWADDR(startpc) == HWADDR(g_eeloadExec))
+	if (g_eeloadExec && hook_pc == hook_addr(g_eeloadExec))
 		xFastCall((void*)eeloadHook2);
 
 	g_branch = 0;

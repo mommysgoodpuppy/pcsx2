@@ -897,7 +897,7 @@ static void recExecute()
 void R5900::Dynarec::OpcodeImpl::recSYSCALL()
 {
 	EE::Profiler.EmitOp(eeOpcode::SYSCALL);
-	if (GPR_IS_CONST1(3))
+	if (!CHECK_FULLTLB && GPR_IS_CONST1(3))
 	{
 		// If it's FlushCache or iFlushCache, we can skip it since we don't support cache in the JIT.
 		if (g_cpuConstRegs[3].UC[0] == 0x64 || g_cpuConstRegs[3].UC[0] == 0x68)

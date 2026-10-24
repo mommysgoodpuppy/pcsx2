@@ -929,6 +929,17 @@ void SYSCALL()
 {
 	u8 call;
 
+	// Under full TLB a user-mode SYSCALL belongs to a guest OS kernel, which numbers
+	// its calls in v0. Keying the BIOS HLE on v1 would act on whatever v1 holds,
+	// e.g. writing through a0 or swallowing the call outright.
+	if (CHECK_FULLTLB && cpuRegs.CP0.n.Status.b.KSU == 2 &&
+		!cpuRegs.CP0.n.Status.b.EXL && !cpuRegs.CP0.n.Status.b.ERL)
+	{
+		cpuRegs.pc -= 4;
+		cpuException(0x20, cpuRegs.branch);
+		return;
+	}
+
 	if (cpuRegs.GPR.n.v1.SL[0] < 0)
 		call = (u8)(-cpuRegs.GPR.n.v1.SL[0]);
 	else

@@ -567,6 +567,17 @@ static __fi void VSyncEnd(u64 sCycle)
 	EECNT_LOG("    ================  EE COUNTER VSYNC END (frame: %d)  ================", g_FrameCount);
 
 	g_FrameCount++;
+
+	// Opt-in, once a second: where the EE is. Lets an agent tell a wedged guest
+	// from a busy one when the guest's own output only reaches the framebuffer.
+	static const bool s_pc_trace = std::getenv("PCSX2_EE_PC_TRACE") != nullptr;
+	if (s_pc_trace && (g_FrameCount % 60) == 0)
+	{
+		Console.WriteLn("EE pc trace: pc=%08x ra=%08x sp=%08x ASID=%02x Status=%08x Cause=%08x EPC=%08x BadVAddr=%08x",
+			cpuRegs.pc, cpuRegs.GPR.n.ra.UL[0], cpuRegs.GPR.n.sp.UL[0], cpuRegs.CP0.n.EntryHi & 0xff,
+			cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause, cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.BadVAddr);
+	}
+
 	if (!GSSMODE1reg.SINT)
 	{
 		hwIntcIrq(INTC_VBLANK_E); // HW Irq

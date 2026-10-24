@@ -484,26 +484,19 @@ namespace COP0 {
 	{
 		int i;
 
-		union
-		{
-			struct
-			{
-				u32 VPN2 : 19;
-				u32 VPN2X : 2;
-				u32 G : 3;
-				u32 ASID : 8;
-			} s;
-			u32 u;
-		} EntryHi32;
-
-		EntryHi32.u = cpuRegs.CP0.n.EntryHi;
+		// Decode with the architectural layout (ASID in bits 0-7, VPN2 in 13-31).
+		// The local bitfield this used to declare had the fields in reverse order,
+		// so probes compared ASID bits against VPN2: Linux's __update_tlb then
+		// rewrote the wrong index and left duplicate entries behind.
+		EntryHi_t probe;
+		probe.UL = cpuRegs.CP0.n.EntryHi;
 
 		cpuRegs.CP0.n.Index = 0xFFFFFFFF;
 		for (i = 0; i < 48; i++)
 		{
 			const u32 mask = ~tlb[i].Mask();
-			if ((tlb[i].EntryHi.VPN2 & mask) == (EntryHi32.s.VPN2 & mask) &&
-				(tlb[i].isGlobal() || tlb[i].EntryHi.ASID == EntryHi32.s.ASID))
+			if ((tlb[i].EntryHi.VPN2 & mask) == (probe.VPN2 & mask) &&
+				(tlb[i].isGlobal() || tlb[i].EntryHi.ASID == probe.ASID))
 			{
 				cpuRegs.CP0.n.Index = i;
 				break;
@@ -574,6 +567,12 @@ cpuRegs.PERF.n.pccr, cpuRegs.PERF.n.pcr0, cpuRegs.PERF.n.pcr1, _Imm_ & 0x3F);*/
 			case 9:
 				cpuRegs.lastCOP0Cycle = cpuRegs.cycle;
 				cpuRegs.CP0.r[9] = cpuRegs.GPR.r[_Rt_].UL[0];
+				break;
+
+			case 10:
+				// Same hook as the recompiler's MTC0: an ASID change must swap the
+				// vtlb over to the new address space's entries.
+				COP0_WriteEntryHi(cpuRegs.GPR.r[_Rt_].UL[0]);
 				break;
 
 			case 12:

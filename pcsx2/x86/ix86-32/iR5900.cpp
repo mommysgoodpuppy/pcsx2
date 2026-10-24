@@ -169,44 +169,6 @@ struct RecExceptionInfo
 
 static std::unordered_map<const void*, RecExceptionInfo> s_rec_exception_info;
 
-static void recTraceFullTLBException(const RecExceptionInfo& info, const void* rip, u32 address, u32 excode)
-{
-	static u32 trace_count = 0;
-	if (info.mips_pc != 0x00406150 || address != 0x00580318 || trace_count++ >= 64)
-		return;
-
-	const u32 asid = cpuRegs.CP0.n.EntryHi & 0xff;
-	const auto& read_map = vtlb_private::vtlbdata.vmap[address >> vtlb_private::VTLB_PAGE_BITS];
-	const auto& write_map = vtlb_private::vtlbdata.vmap_write[address >> vtlb_private::VTLB_PAGE_BITS];
-	Console.Error("FULLTLB trace #%u: rip=%p pc=%08x code=%08x excode=%08x bd=%u addr=%08x gp=%08x",
-		trace_count, rip, info.mips_pc, info.mips_code, excode, info.mips_delay_slot,
-		address, cpuRegs.GPR.r[28].UL[0]);
-	Console.Error("FULLTLB CP0 before: ASID=%02x EntryHi=%08x Status=%08x Cause=%08x EPC=%08x BadVAddr=%08x",
-		asid, cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause,
-		cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.BadVAddr);
-	Console.Error("FULLTLB VTLB: read_raw=%llx read_handler=%u read_id=%u write_raw=%llx write_handler=%u write_id=%u",
-		static_cast<unsigned long long>(read_map.raw()), read_map.isHandler(address),
-		read_map.isHandler(address) ? read_map.assumeHandlerGetID() : 0,
-		static_cast<unsigned long long>(write_map.raw()), write_map.isHandler(address),
-		write_map.isHandler(address) ? write_map.assumeHandlerGetID() : 0);
-
-	for (u32 i = 0; i < std::size(tlb); i++)
-	{
-		const tlbs& entry = tlb[i];
-		const u32 page = address >> 12;
-		const u32 mask = ((~entry.Mask()) << 1) & 0xfffff;
-		if ((page & mask) != ((entry.VPN2() >> 12) & mask))
-			continue;
-
-		Console.Error("FULLTLB HW TLB %u: VPN2=%08x mask=%03x ASID=%02x active=%u G=%u "
-			"Lo0=%08x(P=%08x V=%u D=%u) Lo1=%08x(P=%08x V=%u D=%u)",
-			i, entry.VPN2(), entry.Mask(), entry.EntryHi.ASID,
-			entry.isGlobal() || entry.EntryHi.ASID == asid, entry.isGlobal(), entry.EntryLo0.UL,
-			entry.PFN0(), entry.EntryLo0.V, entry.EntryLo0.D, entry.EntryLo1.UL,
-			entry.PFN1(), entry.EntryLo1.V, entry.EntryLo1.D);
-	}
-}
-
 #ifdef TRACE_BLOCKS
 static void pauseAAA()
 {
@@ -3150,76 +3112,15 @@ static void recDoExceptionExit(void* rip, const u64* gprs, const u128* xmms, u32
 	for (const auto& [reg, value] : info.constant_values)
 		cpuRegs.GPR.r[reg].UD[0] = value;
 
-	if (info.mips_pc >= 0x00477ac8 && info.mips_pc <= 0x00477b0c)
-	{
-		Console.Error("FULLTLB return-path fault: pc=%08x code=%08x addr=%08x ra=%08x sp=%08x t9=%08x",
-			info.mips_pc, info.mips_code,
-			cpuRegs.GPR.r[(info.mips_code >> 21) & 0x1f].UL[0] + static_cast<u32>(static_cast<s16>(info.mips_code)),
-			cpuRegs.GPR.r[31].UL[0], cpuRegs.GPR.r[29].UL[0], cpuRegs.GPR.r[25].UL[0]);
-		for (u32 i = 0; i < iREGCNT_GPR; i++)
-		{
-			if (info.gpr_info[i].reg == 31)
-				Console.Error("FULLTLB ra source: host_gpr=%u type=%u value=%llx", i,
-					info.gpr_info[i].type, static_cast<unsigned long long>(gprs[i]));
-		}
-		for (u32 i = 0; i < iREGCNT_XMM; i++)
-		{
-			if (info.xmm_info[i].reg == 31)
-				Console.Error("FULLTLB ra source: host_xmm=%u type=%u lo=%llx", i,
-					info.xmm_info[i].type, static_cast<unsigned long long>(xmms[i]._u64[0]));
-		}
-	}
-
 	const u32 rs = (info.mips_code >> 21) & 0x1f;
 	const s32 displacement = static_cast<s16>(info.mips_code);
 	const u32 address = cpuRegs.GPR.r[rs].UL[0] + static_cast<u32>(displacement);
-	recTraceFullTLBException(info, rip, address, excode);
-	if ((cpuRegs.CP0.n.EntryHi & 0xff) != 0)
-	{
-		static u32 userspace_exception_count = 0;
-		if (userspace_exception_count++ < 512)
-		{
-			Console.Error("FULLTLB user-sequence #%u: pc=%08x code=%08x excode=%08x bd=%u addr=%08x "
-				"ASID=%02x EntryHi=%08x Status=%08x EPC=%08x",
-				userspace_exception_count, info.mips_pc, info.mips_code, excode,
-				info.mips_delay_slot, address, cpuRegs.CP0.n.EntryHi & 0xff,
-				cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.EPC);
-		}
-	}
-	if (info.mips_pc == 0x00480568 || address < 0x1000)
-	{
-		Console.Error("FULLTLB low-address fault: rip=%p pc=%08x code=%08x excode=%08x bd=%u addr=%08x",
-			rip, info.mips_pc, info.mips_code, excode, info.mips_delay_slot, address);
-		for (u32 i = 0; i < 32; i += 4)
-			Console.Error("FULLTLB GPR r%u=%08x r%u=%08x r%u=%08x r%u=%08x", i,
-				cpuRegs.GPR.r[i].UL[0], i + 1, cpuRegs.GPR.r[i + 1].UL[0], i + 2,
-				cpuRegs.GPR.r[i + 2].UL[0], i + 3, cpuRegs.GPR.r[i + 3].UL[0]);
-	}
-	if (excode == EXC_CODE_Mod && (address & ~0xfffu) == 0x00582000)
-	{
-		static u32 modified_trace_count = 0;
-		if (modified_trace_count++ < 32)
-		{
-			Console.Error("FULLTLB modified #%u: rip=%p pc=%08x code=%08x addr=%08x base=r%u=%08x value=r%u=%08x "
-				"EntryHi=%08x Status=%08x Cause=%08x EPC=%08x",
-				modified_trace_count, rip, info.mips_pc, info.mips_code, address, rs,
-				cpuRegs.GPR.r[rs].UL[0], (info.mips_code >> 16) & 0x1f,
-				cpuRegs.GPR.r[(info.mips_code >> 16) & 0x1f].UL[0], cpuRegs.CP0.n.EntryHi,
-				cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause, cpuRegs.CP0.n.EPC);
-		}
-	}
 	cpuRegs.pc = info.mips_pc + 4;
 	cpuRegs.branch = info.mips_delay_slot;
 	if ((excode & ~EXC_CODE_TLB_INVALID) == EXC_CODE_TLBL ||
 		(excode & ~EXC_CODE_TLB_INVALID) == EXC_CODE_TLBS || excode == EXC_CODE_Mod)
 	{
 		cpuTlbMiss(address, info.mips_delay_slot, excode);
-		if (info.mips_pc == 0x00406150 && address == 0x00580318)
-		{
-			Console.Error("FULLTLB CP0 after: EntryHi=%08x Status=%08x Cause=%08x EPC=%08x BadVAddr=%08x next_pc=%08x",
-				cpuRegs.CP0.n.EntryHi, cpuRegs.CP0.n.Status.val, cpuRegs.CP0.n.Cause,
-				cpuRegs.CP0.n.EPC, cpuRegs.CP0.n.BadVAddr, cpuRegs.pc);
-		}
 	}
 	else
 	{

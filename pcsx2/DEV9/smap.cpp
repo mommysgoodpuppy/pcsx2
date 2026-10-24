@@ -117,6 +117,31 @@ u32 wswap(u32 d)
 	return (d >> 16) | (d << 16);
 }
 
+// Diagnostic: which TX FIFO words were written since a frame last consumed them.
+// A frame that reads an unwritten word is sending stale FIFO contents.
+static bool s_txfifo_written[16 * 1024 / 4];
+static u32 s_tx_stale_reports;
+
+static void smap_MarkTxWritten(u32 offset)
+{
+	s_txfifo_written[(offset & (SMAP_TX_BUFSIZE - 1)) / 4] = true;
+}
+
+static void smap_CheckTxStale(u32 base, u32 length)
+{
+	u32 stale = 0, first = 0;
+	for (u32 i = 0; i < length; i += 4)
+	{
+		const u32 word = ((base + i) & (SMAP_TX_BUFSIZE - 1)) / 4;
+		if (!s_txfifo_written[word] && stale++ == 0)
+			first = i;
+		s_txfifo_written[word] = false;
+	}
+	if (stale && s_tx_stale_reports++ < 16)
+		Console.Error("DEV9: SMAP TX stale: frame base=%x len=%u has %u unwritten words (first at +%u), wr_ptr=%x txbdi=%u",
+			base, length, stale, first, dev9Ru32(SMAP_R_TXFIFO_WR_PTR), dev9.txbdi);
+}
+
 void tx_process()
 {
 	NetPacket pk;
@@ -144,7 +169,9 @@ void tx_process()
 		}
 		else
 		{
-			const u32 base = (pbd->pointer - 0x1000) & 16383;
+			// The TX FIFO is 4 KB (BDs address it as 0x1000-0x1fff) and its write
+			// pointer wraps there; drivers that keep writing across the wrap rely on it.
+			const u32 base = (pbd->pointer - 0x1000) & (SMAP_TX_BUFSIZE - 1);
 			DevCon.WriteLn("DEV9: Sending Packet from base %x, size %d", base, pbd->length);
 
 			pk.size = pbd->length;
@@ -212,9 +239,10 @@ void tx_process()
 			}
 			*/
 
-			if (base + pbd->length > 16384)
+			smap_CheckTxStale(base, pbd->length);
+			if (base + pbd->length > SMAP_TX_BUFSIZE)
 			{
-				u32 was = 16384 - base;
+				u32 was = SMAP_TX_BUFSIZE - base;
 				memcpy(pk.buffer, dev9.txfifo + base, was);
 				memcpy(pk.buffer + was, dev9.txfifo, pbd->length - was);
 				DevCon.WriteLn("DEV9: Warped read, was=%u, sz=%u, sz-was=%u", was, pbd->length, pbd->length - was);
@@ -681,7 +709,7 @@ void smap_write16(u32 addr, u16 value)
 
 		case SMAP_R_TXFIFO_WR_PTR:
 			DevCon.WriteLn("DEV9: SMAP: SMAP_R_TXFIFO_WR_PTR 16bit write %x", value);
-			dev9Ru16(addr) = value;
+			dev9Ru16(addr) = value & (SMAP_TX_BUFSIZE - 1);
 			return;
 #define EMAC3_L_WRITE(name)                                   \
 	case name:                                                \
@@ -806,7 +834,8 @@ void smap_write32(u32 addr, u32 value)
 		case SMAP_R_TXFIFO_DATA:
 			//DevCon.WriteLn("DEV9: SMAP_R_TXFIFO_DATA 32bit write %x", value);
 			*((u32*)(dev9.txfifo + dev9Ru32(SMAP_R_TXFIFO_WR_PTR))) = value;
-			dev9Ru32(SMAP_R_TXFIFO_WR_PTR) = (dev9Ru32(SMAP_R_TXFIFO_WR_PTR) + 4) & 16383;
+			smap_MarkTxWritten(dev9Ru32(SMAP_R_TXFIFO_WR_PTR));
+			dev9Ru32(SMAP_R_TXFIFO_WR_PTR) = (dev9Ru32(SMAP_R_TXFIFO_WR_PTR) + 4) & (SMAP_TX_BUFSIZE - 1);
 			return;
 		default:
 			DevCon.WriteLn("DEV9: SMAP : Unknown 32 bit write @ %X,v=%X", addr, value);
@@ -840,7 +869,7 @@ void smap_writeDMA8Mem(u32* pMem, int size)
 {
 	if (dev9Ru16(SMAP_R_TXFIFO_CTRL) & SMAP_TXFIFO_DMAEN)
 	{
-		dev9Ru32(SMAP_R_TXFIFO_WR_PTR) &= 16383;
+		dev9Ru32(SMAP_R_TXFIFO_WR_PTR) &= SMAP_TX_BUFSIZE - 1;
 
 		DevCon.WriteLn("DEV9:  * * SMAP DMA WRITE START: wr_ptr=%d, rd_ptr=%d", dev9Ru32(SMAP_R_TXFIFO_WR_PTR), dev9.txfifo_rd_ptr);
 		while (size > 0)
@@ -850,12 +879,20 @@ void smap_writeDMA8Mem(u32* pMem, int size)
 			pMem++;
 
 			*((u32*)(dev9.txfifo + dev9Ru32(SMAP_R_TXFIFO_WR_PTR))) = value;
-			dev9Ru32(SMAP_R_TXFIFO_WR_PTR) = (dev9Ru32(SMAP_R_TXFIFO_WR_PTR) + 4) & 16383;
+			smap_MarkTxWritten(dev9Ru32(SMAP_R_TXFIFO_WR_PTR));
+			dev9Ru32(SMAP_R_TXFIFO_WR_PTR) = (dev9Ru32(SMAP_R_TXFIFO_WR_PTR) + 4) & (SMAP_TX_BUFSIZE - 1);
 			size -= 4;
 		}
 		DevCon.WriteLn("DEV9:  * * SMAP DMA WRITE END:   wr_ptr=%d, rd_ptr=%d", dev9Ru32(SMAP_R_TXFIFO_WR_PTR), dev9.txfifo_rd_ptr);
 
 		dev9Ru16(SMAP_R_TXFIFO_CTRL) &= ~SMAP_TXFIFO_DMAEN;
+	}
+	else
+	{
+		static u32 dropped = 0;
+		if (dropped++ < 16)
+			Console.Error("DEV9: SMAP TX DMA of %d bytes dropped: TXFIFO_CTRL=%04x (DMAEN clear), wr_ptr=%x",
+				size, dev9Ru16(SMAP_R_TXFIFO_CTRL), dev9Ru32(SMAP_R_TXFIFO_WR_PTR));
 	}
 }
 

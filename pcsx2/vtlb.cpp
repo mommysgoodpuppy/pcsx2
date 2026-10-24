@@ -247,12 +247,21 @@ RETURNS_R128 vtlb_memRead128(u32 mem)
 	}
 }
 
+// Stores go through the write map under full TLB, where clean (D=0) pages route
+// to TlbModifiedHandler. Using the read map let interpreter stores land silently
+// in read-only pages (the zero page, COW pages), and Linux later replaced the
+// page and lost them.
+static __fi VTLBVirtual vtlb_GetWriteMapping(u32 addr)
+{
+	return (CHECK_FULLTLB ? vtlbdata.vmap_write : vtlbdata.vmap)[addr >> VTLB_PAGE_BITS];
+}
+
 template <typename DataType>
 void vtlb_memWrite(u32 addr, DataType data)
 {
 	static const uint DataSize = sizeof(DataType) * 8;
 
-	auto vmv = vtlbdata.vmap[addr >> VTLB_PAGE_BITS];
+	auto vmv = vtlb_GetWriteMapping(addr);
 
 	if (!vmv.isHandler(addr))
 	{
@@ -291,7 +300,7 @@ void vtlb_memWrite(u32 addr, DataType data)
 
 void TAKES_R128 vtlb_memWrite128(u32 mem, r128 value)
 {
-	auto vmv = vtlbdata.vmap[mem >> VTLB_PAGE_BITS];
+	auto vmv = vtlb_GetWriteMapping(mem);
 
 	if (!vmv.isHandler(mem))
 	{
@@ -571,7 +580,32 @@ static __ri void vtlb_BusError(u32 addr, u32 mode)
 	Console.Error(message);
 }
 
+// Full-TLB exception handlers for the interpreter. The recompiler replaces these
+// with generated exception exits (vtlb_SetExceptionHandlers); left unregistered,
+// a fault on a refill/invalid/read-only page silently read as zero, and every
+// fetch from a not-yet-present user page executed as a nop.
+static __ri void vtlb_FullTLBFault(u32 addr, u32 excode)
+{
+	cpuTlbMiss(addr, cpuRegs.branch, excode);
+	Cpu->CancelInstruction();
+}
+
 // clang-format off
+template <u32 Excode, typename OperandType>
+static OperandType vtlbTlbFaultReadSm(u32 addr) { vtlb_FullTLBFault(addr, Excode); return 0; }
+template <u32 Excode>
+static RETURNS_R128 vtlbTlbFaultReadLg(u32 addr) { vtlb_FullTLBFault(addr, Excode); return r128_zero(); }
+template <u32 Excode, typename OperandType>
+static void vtlbTlbFaultWriteSm(u32 addr, OperandType data) { vtlb_FullTLBFault(addr, Excode); }
+template <u32 Excode>
+static void TAKES_R128 vtlbTlbFaultWriteLg(u32 addr, r128 data) { vtlb_FullTLBFault(addr, Excode); }
+
+#define VTLB_BuildTlbFaultHandler(read_code, write_code) \
+	vtlbTlbFaultReadSm<read_code, mem8_t>, vtlbTlbFaultReadSm<read_code, mem16_t>, vtlbTlbFaultReadSm<read_code, mem32_t>, \
+	vtlbTlbFaultReadSm<read_code, mem64_t>, vtlbTlbFaultReadLg<read_code>, \
+	vtlbTlbFaultWriteSm<write_code, mem8_t>, vtlbTlbFaultWriteSm<write_code, mem16_t>, vtlbTlbFaultWriteSm<write_code, mem32_t>, \
+	vtlbTlbFaultWriteSm<write_code, mem64_t>, vtlbTlbFaultWriteLg<write_code>
+
 template <typename OperandType>
 static OperandType vtlbUnmappedVReadSm(u32 addr) { vtlb_Miss(addr, 0); return 0; }
 static RETURNS_R128 vtlbUnmappedVReadLg(u32 addr) { vtlb_Miss(addr, 0); return r128_zero(); }
@@ -1208,8 +1242,11 @@ void vtlb_VMap(u32 vaddr, u32 paddr, u32 size, bool writable)
 		vtlbdata.vmap[vidx] = vmv;
 		if (CHECK_FULLTLB)
 		{
+			// Like the refill/invalid mappings, hand the handler the virtual address:
+			// the interpreter's handler reports it as BadVAddr. (The recompiler's exit
+			// recomputes the address from the instruction and ignores it.)
 			vtlbdata.vmap_write[vidx] = writable ? vmv :
-				VTLBVirtual(VTLBPhysical::fromHandler(TlbModifiedHandler), paddr, vaddr);
+				VTLBVirtual(VTLBPhysical::fromHandler(TlbModifiedHandler), vaddr, vaddr);
 		}
 		if (vtlbdata.ppmap)
 		{
@@ -1338,9 +1375,9 @@ void vtlb_Init()
 	UnmappedVirtHandler = vtlb_RegisterHandler(VTLB_BuildUnmappedHandler(vtlbUnmappedV));
 	UnmappedPhyHandler = vtlb_RegisterHandler(VTLB_BuildUnmappedHandler(vtlbUnmappedP));
 	DefaultPhyHandler = vtlb_RegisterHandler(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-	TlbRefillHandler = vtlb_RegisterHandler(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-	TlbInvalidHandler = vtlb_RegisterHandler(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-	TlbModifiedHandler = vtlb_RegisterHandler(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+	TlbRefillHandler = vtlb_RegisterHandler(VTLB_BuildTlbFaultHandler(EXC_CODE_TLBL, EXC_CODE_TLBS));
+	TlbInvalidHandler = vtlb_RegisterHandler(VTLB_BuildTlbFaultHandler(EXC_CODE_TLBL | EXC_CODE_TLB_INVALID, EXC_CODE_TLBS | EXC_CODE_TLB_INVALID));
+	TlbModifiedHandler = vtlb_RegisterHandler(VTLB_BuildTlbFaultHandler(EXC_CODE_Mod, EXC_CODE_Mod));
 
 	//done !
 

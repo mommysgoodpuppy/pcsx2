@@ -2341,6 +2341,78 @@ static bool recSkipTimeoutLoop(s32 reg, bool is_timeout_loop)
 	return true;
 }
 
+// Full TLB: a branch in the last word of a page whose delay slot lies on a page
+// that would fault on fetch. Returns that fault's exception code, or 0.
+static u32 recFullTLBDelaySlotFetchFault(u32 branch_pc, u32 code)
+{
+	if ((branch_pc & 0xffc) != 0xffc)
+		return 0;
+
+	const u32 flags = R5900::GetInstruction(code).flags;
+	if (!(flags & IS_BRANCH))
+		return 0;
+
+	const u32 branch_type = flags & BRANCHTYPE_MASK;
+	if (branch_type == BRANCHTYPE_SYSCALL || branch_type == BRANCHTYPE_ERET)
+		return 0;
+
+	return vtlb_GetFetchExceptionCode(branch_pc + 4);
+}
+
+// Whether a branch-likely nullifies its delay slot, i.e. the slot is never fetched.
+// Only GPR and COP1 conditions are decoded; anything else reports taken, which at
+// worst costs one spurious refill on a page the guest has mapped anyway.
+static bool recBranchLikelyNotTaken(u32 code, u32 flags)
+{
+	const s64 rs = cpuRegs.GPR.r[(code >> 21) & 0x1f].SD[0];
+	const s64 rt = cpuRegs.GPR.r[(code >> 16) & 0x1f].SD[0];
+	const u32 cond = flags & 0x7;
+
+	switch (flags & BRANCHTYPE_MASK)
+	{
+		case BRANCHTYPE_BRANCH:
+			switch (cond)
+			{
+				case CONDTYPE_EQ: return rs != rt;
+				case CONDTYPE_NE: return rs == rt;
+				case CONDTYPE_LEZ: return rs > 0;
+				case CONDTYPE_GTZ: return rs <= 0;
+				case CONDTYPE_LTZ: return rs >= 0;
+				case CONDTYPE_GEZ: return rs < 0;
+			}
+			break;
+
+		case BRANCHTYPE_BC1:
+		{
+			const bool c = (fpuRegs.fprc[31] & 0x00800000) != 0;
+			return (cond == CONDTYPE_EQ) ? c : !c; // BC1FL / BC1TL
+		}
+	}
+
+	return false;
+}
+
+// Executes a page-final branch whose delay slot cannot be fetched, without
+// compiling it. Raises the delay-slot fetch fault with EPC at the branch and
+// Cause.BD set; the branch re-executes after the handler maps the page.
+static void recFullTLBCrossPageBranch(u32 branch_pc, u32 code, u32 excode)
+{
+	const u32 flags = R5900::GetInstruction(code).flags;
+	if ((flags & IS_LIKELY) && recBranchLikelyNotTaken(code, flags))
+	{
+		// Nullified slot: only the link (BLTZALL/BGEZALL) is architecturally visible.
+		if (flags & IS_LINKED)
+			cpuRegs.GPR.n.ra.SD[0] = static_cast<s32>(branch_pc + 8);
+		cpuRegs.pc = branch_pc + 8;
+		return;
+	}
+
+	// cpuTlbMiss() steps pc back one word and the BD path another, so EPC = branch_pc.
+	cpuRegs.pc = branch_pc + 8;
+	cpuRegs.branch = false;
+	cpuTlbMiss(branch_pc + 4, true, excode);
+}
+
 static void recRecompile(const u32 startpc)
 {
 	if (CHECK_FULLTLB)
@@ -2350,6 +2422,13 @@ static void recRecompile(const u32 startpc)
 			cpuRegs.pc = startpc + 4;
 			cpuRegs.branch = false;
 			cpuTlbMiss(startpc, false, excode);
+			return;
+		}
+
+		const u32 code = *static_cast<u32*>(recGetMemPtr(startpc));
+		if (const u32 excode = recFullTLBDelaySlotFetchFault(startpc, code); excode != 0)
+		{
+			recFullTLBCrossPageBranch(startpc, code, excode);
 			return;
 		}
 	}
@@ -2518,6 +2597,15 @@ static void recRecompile(const u32 startpc)
 		}
 
 		cpuRegs.code = *static_cast<int*>(recGetMemPtr(i));
+
+		// Run the mapped prefix first; the branch then starts its own block, where
+		// recRecompile() raises the delay-slot fault in architectural order.
+		if (CHECK_FULLTLB && i != startpc && recFullTLBDelaySlotFetchFault(i, cpuRegs.code) != 0)
+		{
+			willbranch3 = 1;
+			s_nEndBlock = i;
+			break;
+		}
 
 		if (is_timeout_loop)
 		{

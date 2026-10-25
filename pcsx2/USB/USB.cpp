@@ -231,6 +231,8 @@ bool USB::DoOHCIState(StateWrapper& sw)
 	sw.DoArray(s_qemu_ohci->usb_buf, sizeof(s_qemu_ohci->usb_buf));
 	sw.Do(&s_qemu_ohci->async_td);
 	sw.Do(&s_qemu_ohci->async_complete);
+	if (sw.IsReading())
+		s_qemu_ohci->irq_line = (s_qemu_ohci->intr & OHCI_INTR_MIE) && (s_qemu_ohci->intr_status & s_qemu_ohci->intr);
 	return true;
 }
 

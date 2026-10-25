@@ -40,6 +40,7 @@ typedef struct OHCIState
 	u32 ctl, status;
 	u32 intr_status;
 	u32 intr;
+	bool irq_line; /* level of the interrupt output, derived from intr/intr_status */
 
 	/* memory pointer partition */
 	u32 hcca;

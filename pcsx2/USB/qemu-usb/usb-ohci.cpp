@@ -14,8 +14,6 @@
 #define DMA_DIRECTION_FROM_DEVICE 1
 #define ED_LINK_LIMIT 32
 
-extern s64 g_usb_last_cycle;
-#define MIN_IRQ_INTERVAL 64 /* hack */
 
 extern s64 usb_get_clock();
 extern int usb_get_ticks_per_second();
@@ -50,21 +48,16 @@ static u64 muldiv64(u64 a, u32 b, u32 c)
 /* Update IRQ levels */
 static inline void ohci_intr_update(OHCIState* ohci)
 {
-	int level = 0;
+	const bool level = (ohci->intr & OHCI_INTR_MIE) && (ohci->intr_status & ohci->intr);
 
-	if ((ohci->intr & OHCI_INTR_MIE) &&
-		(ohci->intr_status & ohci->intr))
-		level = 1;
-
-	if (level)
-	{
-
-		if ((usb_get_clock() - g_usb_last_cycle) > MIN_IRQ_INTERVAL)
-		{
-			usbIrq(1);
-			g_usb_last_cycle = usb_get_clock();
-		}
-	}
+	// The OHCI interrupt output is a level, but the IOP INTC latches edges: raise
+	// it only when the line goes high, as the hardware does. Raising it again for
+	// every event while the line is already high delivers interrupts with nothing
+	// left to service, and Linux's ohci-ps2 (which masks MIE on entry and only
+	// unmasks it after servicing something) then never unmasks MIE again.
+	if (level && !ohci->irq_line)
+		usbIrq(1);
+	ohci->irq_line = level;
 }
 
 /* Set an interrupt */
@@ -252,6 +245,7 @@ void ohci_soft_reset(OHCIState* ohci)
 	ohci->status = 0;
 	ohci->intr_status = 0;
 	ohci->intr = OHCI_INTR_MIE;
+	ohci->irq_line = false;
 
 	ohci->hcca = 0;
 	ohci->ctrl_head = ohci->ctrl_cur = 0;
